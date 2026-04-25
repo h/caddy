@@ -247,15 +247,15 @@ func TestE2E_PickServersOnRealCaddyfileLayout(t *testing.T) {
 		t.Fatal("srv0 not present in the loaded http app")
 	}
 
-	// Run the picker; it must always return exactly srv0 (the HTTPS
-	// server) and exclude the redirect server.
+	// Run the picker; it must always return srv0 (the HTTPS server),
+	// not the redirect server.
 	for i := 0; i < 20; i++ {
-		got, err := pickServers(httpApp)
+		got, err := pickServer(httpApp)
 		if err != nil {
-			t.Fatalf("pickServers error on real config: %v", err)
+			t.Fatalf("pickServer error on real config: %v", err)
 		}
-		if len(got) != 1 || got[0] != srv0 {
-			t.Fatalf("pickServers returned wrong candidates on real config; expected [srv0], got %d candidates", len(got))
+		if got != srv0 {
+			t.Fatalf("pickServer returned wrong server on real config; expected srv0")
 		}
 	}
 }

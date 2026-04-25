@@ -41,10 +41,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -151,47 +153,28 @@ func (p *Permission) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		return d.ArgErr()
 	}
 	for nesting := d.Nesting(); d.NextBlock(nesting); {
-		switch d.Val() {
+		key := d.Val()
+		var raw string
+		if !d.AllArgs(&raw) {
+			return d.ArgErr()
+		}
+		switch key {
 		case "method":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			p.Method = d.Val()
-			if d.NextArg() {
-				return d.ArgErr()
-			}
+			p.Method = raw
 		case "timeout":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			dur, err := caddy.ParseDuration(d.Val())
+			dur, err := caddy.ParseDuration(raw)
 			if err != nil {
 				return d.Errf("parsing timeout: %v", err)
 			}
 			p.Timeout = caddy.Duration(dur)
-			if d.NextArg() {
-				return d.ArgErr()
-			}
 		case "random_host_challenge":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			val := d.Val()
-			var b bool
-			switch strings.ToLower(val) {
-			case "true", "on", "yes":
-				b = true
-			case "false", "off", "no":
-				b = false
-			default:
-				return d.Errf("random_host_challenge must be true/false, got %q", val)
+			b, err := strconv.ParseBool(raw)
+			if err != nil {
+				return d.Errf("random_host_challenge: %v", err)
 			}
 			p.RandomHostChallenge = &b
-			if d.NextArg() {
-				return d.ArgErr()
-			}
 		default:
-			return d.Errf("unrecognized directive %q", d.Val())
+			return d.Errf("unrecognized directive %q", key)
 		}
 	}
 	return nil
@@ -274,44 +257,26 @@ func (p *Permission) randomHostChallengeEnabled() bool {
 }
 
 // randomizeFirstLabel replaces the leftmost DNS label of name with a
-// cryptographically random 16-character lowercase alphanumeric string.
-// If name has no dots, the entire string is replaced.
+// cryptographically random 16-character hex string (a-f0-9, all
+// DNS-label-safe). If name has no dots, the entire string is replaced.
 //
-// Uses rejection sampling so each character is uniformly distributed
-// across the alphabet (no modulo bias).
+// Hex encoding gives a uniform distribution by construction, so no
+// rejection sampling is needed. The 64 bits of entropy is far more
+// than enough — an attacker would need to register every name in the
+// space to defeat the host-blind check.
 func randomizeFirstLabel(name string) string {
-	const labelLen = 16
-	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-	const alphaLen = byte(len(alphabet)) // 36
-	// Largest multiple of alphaLen that fits in a byte; bytes >= this
-	// value are rejected to avoid modulo bias.
-	const cutoff = byte(256 - (256 % int(alphaLen)))
-
-	out := make([]byte, 0, labelLen)
-	buf := make([]byte, labelLen*2) // size buf bigger than needed; refill if exhausted
-	for len(out) < labelLen {
-		if _, err := rand.Read(buf); err != nil {
-			// crypto/rand is documented to never fail on supported platforms.
-			// A deterministic fallback would let an attacker predict the
-			// randomized hostname, so panic instead.
-			panic(fmt.Sprintf("probe: crypto/rand failure: %v", err))
-		}
-		for _, b := range buf {
-			if b >= cutoff {
-				continue // reject biased bytes
-			}
-			out = append(out, alphabet[b%alphaLen])
-			if len(out) == labelLen {
-				break
-			}
-		}
+	var buf [8]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		// crypto/rand is documented to never fail on supported platforms;
+		// a fallback would let an attacker predict the random label, so
+		// panic instead.
+		panic(fmt.Sprintf("probe: crypto/rand failure: %v", err))
 	}
-	randomLabel := string(out)
-
+	label := hex.EncodeToString(buf[:])
 	if i := strings.IndexByte(name, '.'); i >= 0 {
-		return randomLabel + name[i:]
+		return label + name[i:]
 	}
-	return randomLabel
+	return label
 }
 
 // dispatchViaHTTPApp is the production dispatcher: it picks the HTTPS
@@ -325,7 +290,7 @@ func randomizeFirstLabel(name string) string {
 //     hostname was unrouted, which the caller treats as denial.
 //   - err: a real probe failure (no http app, no eligible server,
 //     handler panic). Distinct from a denial.
-func (p *Permission) dispatchViaHTTPApp(ctx context.Context, method, hostname string) (int, bool, error) {
+func (p *Permission) dispatchViaHTTPApp(ctx context.Context, method, hostname string) (status int, matched bool, err error) {
 	httpAppIface, err := p.ctx.AppIfConfigured("http")
 	if err != nil || httpAppIface == nil {
 		return 0, false, fmt.Errorf("http app not available: %v", err)
@@ -335,13 +300,11 @@ func (p *Permission) dispatchViaHTTPApp(ctx context.Context, method, hostname st
 		return 0, false, fmt.Errorf("http app has unexpected type %T", httpAppIface)
 	}
 
-	candidates, err := pickServers(httpApp)
+	srv, err := pickServer(httpApp)
 	if err != nil {
 		return 0, false, err
 	}
 
-	// Build a synthetic request once; servers are dispatched against
-	// the same request copy.
 	req := httptest.NewRequest(method, "/", nil)
 	req.Host = hostname
 	req.URL.Host = hostname
@@ -358,74 +321,51 @@ func (p *Permission) dispatchViaHTTPApp(ctx context.Context, method, hostname st
 	req.RemoteAddr = "0.0.0.0:0"
 	req = req.WithContext(ctx)
 
-	// Try each candidate in deterministic name-sorted order. The first
-	// that actually handles the request (probeWriter records a write)
-	// wins. With the canonical single-HTTPS-server layout this is
-	// always the only iteration.
-	for _, srv := range candidates {
-		pw := newProbeWriter()
+	pw := newProbeWriter()
 
-		// Recover from any panic in the handler chain so a misbehaving
-		// downstream handler can't tear down the certmagic decision
-		// goroutine.
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					if c := p.logger.Check(zapcore.ErrorLevel, "handler panicked during probe; continuing to next candidate"); c != nil {
-						c.Write(zap.String("domain", hostname), zap.Any("panic", r))
-					}
-				}
-			}()
-			srv.ServeHTTP(pw, req)
-		}()
-
-		if pw.handled {
-			return pw.status, true, nil
+	// Recover from any panic in the handler chain so a misbehaving
+	// downstream handler can't tear down the certmagic decision
+	// goroutine. Surface as an error rather than a silent no-match,
+	// so an operator can see "panic" instead of "no route matched".
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("handler panicked: %v", r)
+			if c := p.logger.Check(zapcore.ErrorLevel, "handler panicked during probe"); c != nil {
+				c.Write(zap.String("domain", hostname), zap.Any("panic", r))
+			}
 		}
-	}
+	}()
+	srv.ServeHTTP(pw, req)
 
-	// No candidate's handler chain wrote anything for this hostname.
-	return 0, false, nil
+	if !pw.handled {
+		return 0, false, nil
+	}
+	return pw.status, true, nil
 }
 
-// pickServers returns every http server that listens on the
-// configured HTTPS port, sorted by server name for determinism. This
-// mirrors Caddy's physical routing: a real client request for an
-// on-demand-protected hostname arrives on the HTTPS listener and is
-// routed to whichever Server bound that port. The auto-generated
+// pickServer returns the http server through which the probe should
+// be dispatched: the (alphabetically first) server whose Listen
+// addresses cover the configured HTTPS port. Mirrors Caddy's physical
+// routing — a real on-demand request arrives on the HTTPS listener
+// and is routed to whichever Server bound it. The auto-generated
 // `remaining_auto_https_redirects` server listens on the HTTP port
-// and is therefore filtered out naturally.
-//
-// In the canonical single-HTTPS-server layout this returns one
-// element. In multi-HTTPS-server configurations it returns all
-// candidates; the caller dispatches through them in order until one
-// actually handles the request.
-func pickServers(app *caddyhttp.App) ([]*caddyhttp.Server, error) {
+// only, so it's filtered out by the port match.
+func pickServer(app *caddyhttp.App) (*caddyhttp.Server, error) {
 	httpsPort := app.HTTPSPort
 	if httpsPort == 0 {
 		httpsPort = caddyhttp.DefaultHTTPSPort
 	}
-
-	type named struct {
-		name string
-		srv  *caddyhttp.Server
+	names := make([]string, 0, len(app.Servers))
+	for name := range app.Servers {
+		names = append(names, name)
 	}
-	var matches []named
-	for name, srv := range app.Servers {
-		if serverListensOnPort(srv, httpsPort) {
-			matches = append(matches, named{name: name, srv: srv})
+	sort.Strings(names)
+	for _, name := range names {
+		if serverListensOnPort(app.Servers[name], httpsPort) {
+			return app.Servers[name], nil
 		}
 	}
-	if len(matches) == 0 {
-		return nil, fmt.Errorf("no http server listens on https port %d", httpsPort)
-	}
-	sort.Slice(matches, func(i, j int) bool { return matches[i].name < matches[j].name })
-
-	out := make([]*caddyhttp.Server, len(matches))
-	for i, m := range matches {
-		out[i] = m.srv
-	}
-	return out, nil
+	return nil, fmt.Errorf("no http server listens on https port %d", httpsPort)
 }
 
 // serverListensOnPort reports whether any of srv.Listen's addresses

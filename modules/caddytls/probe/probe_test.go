@@ -505,30 +505,29 @@ func httpsAppWith(servers map[string]*caddyhttp.Server) *caddyhttp.App {
 	return &caddyhttp.App{Servers: servers}
 }
 
-func TestPickServers_FiltersOutRedirectServer(t *testing.T) {
+func TestPickServer_FiltersOutRedirectServer(t *testing.T) {
 	// Canonical auto-HTTPS scenario. The user-defined HTTPS server
 	// (`srv0`) listens on :443 and the auto-generated redirect server
-	// (`remaining_auto_https_redirects`) listens on :80. The redirect
-	// server must never appear in the candidate list.
+	// (`remaining_auto_https_redirects`) listens on :80. pickServer
+	// must always return the HTTPS one, never the redirect one,
+	// regardless of map iteration order.
 	tlsSrv := httpsServer()
 	app := httpsAppWith(map[string]*caddyhttp.Server{
 		"srv0":                           tlsSrv,
 		"remaining_auto_https_redirects": httpRedirectServer(),
 	})
 	for i := 0; i < 20; i++ {
-		got, err := pickServers(app)
+		got, err := pickServer(app)
 		if err != nil {
-			t.Fatalf("pickServers error: %v", err)
+			t.Fatalf("pickServer error: %v", err)
 		}
-		if len(got) != 1 || got[0] != tlsSrv {
-			t.Fatalf("expected exactly the HTTPS server; got %d candidates", len(got))
+		if got != tlsSrv {
+			t.Fatalf("expected the HTTPS server; got the redirect server")
 		}
 	}
 }
 
-func TestPickServers_HonorsCustomHTTPSPort(t *testing.T) {
-	// User overrides https_port to 9443. The HTTPS server should be
-	// selected based on the configured port, not the default 443.
+func TestPickServer_HonorsCustomHTTPSPort(t *testing.T) {
 	tlsSrv := &caddyhttp.Server{Listen: []string{":9443"}}
 	app := &caddyhttp.App{
 		HTTPSPort: 9443,
@@ -537,62 +536,58 @@ func TestPickServers_HonorsCustomHTTPSPort(t *testing.T) {
 			"remaining_auto_https_redirects": &caddyhttp.Server{Listen: []string{":9080"}},
 		},
 	}
-	got, err := pickServers(app)
+	got, err := pickServer(app)
 	if err != nil {
-		t.Fatalf("pickServers error: %v", err)
+		t.Fatalf("pickServer error: %v", err)
 	}
-	if len(got) != 1 || got[0] != tlsSrv {
+	if got != tlsSrv {
 		t.Error("expected the server listening on the custom https_port")
 	}
 }
 
-func TestPickServers_HonorsPortRangeListen(t *testing.T) {
+func TestPickServer_HonorsPortRangeListen(t *testing.T) {
 	tlsSrv := &caddyhttp.Server{Listen: []string{":8000-9000"}}
 	app := &caddyhttp.App{
 		HTTPSPort: 8443,
 		Servers:   map[string]*caddyhttp.Server{"srv0": tlsSrv},
 	}
-	got, err := pickServers(app)
+	got, err := pickServer(app)
 	if err != nil {
-		t.Fatalf("pickServers error: %v", err)
+		t.Fatalf("pickServer error: %v", err)
 	}
-	if len(got) != 1 || got[0] != tlsSrv {
+	if got != tlsSrv {
 		t.Error("expected port-range listen to be matched")
 	}
 }
 
-func TestPickServers_ErrorsWhenNoServerListensOnHTTPS(t *testing.T) {
+func TestPickServer_ErrorsWhenNoServerListensOnHTTPS(t *testing.T) {
 	app := httpsAppWith(map[string]*caddyhttp.Server{
 		"remaining_auto_https_redirects": httpRedirectServer(),
 	})
-	if _, err := pickServers(app); err == nil {
+	if _, err := pickServer(app); err == nil {
 		t.Error("expected error when no server listens on https port; got nil")
 	}
 }
 
-func TestPickServers_ReturnsAllHTTPSServersInNameOrder(t *testing.T) {
-	// Multiple servers that listen on the HTTPS port: pickServers must
-	// return all of them, deterministically sorted by name. The
-	// dispatcher will then try each in order until one handles the
-	// hostname.
+func TestPickServer_PicksFirstByNameWhenMultipleHTTPSServers(t *testing.T) {
+	// In the rare config where multiple servers list the HTTPS port
+	// in their Listen, pickServer returns the alphabetically-first one
+	// deterministically. The OS won't actually let two servers bind
+	// the same port simultaneously, so this only matters for the
+	// pre-bind config view.
 	a := &caddyhttp.Server{Listen: []string{":443"}}
 	b := &caddyhttp.Server{Listen: []string{":443"}}
-	c := &caddyhttp.Server{Listen: []string{":443"}}
 	app := httpsAppWith(map[string]*caddyhttp.Server{
-		"srv2": c,
-		"srv0": a,
 		"srv1": b,
+		"srv0": a,
 	})
 	for i := 0; i < 20; i++ {
-		got, err := pickServers(app)
+		got, err := pickServer(app)
 		if err != nil {
-			t.Fatalf("pickServers error: %v", err)
+			t.Fatalf("pickServer error: %v", err)
 		}
-		if len(got) != 3 {
-			t.Fatalf("expected 3 candidates; got %d", len(got))
-		}
-		if got[0] != a || got[1] != b || got[2] != c {
-			t.Errorf("expected name-sorted order [srv0, srv1, srv2]; got different order on iteration %d", i)
+		if got != a {
+			t.Errorf("expected name-sorted first (srv0); got something else on iteration %d", i)
 		}
 	}
 }
