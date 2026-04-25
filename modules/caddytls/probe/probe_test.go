@@ -592,13 +592,6 @@ func TestPickServer_PicksFirstByNameWhenMultipleHTTPSServers(t *testing.T) {
 	}
 }
 
-func TestServerListensOnPort_RejectsMalformedListen(t *testing.T) {
-	srv := &caddyhttp.Server{Listen: []string{"not a valid address"}}
-	if serverListensOnPort(srv, 443) {
-		t.Error("malformed listen address should not match")
-	}
-}
-
 // ============================================================
 // probeWriter
 // ============================================================

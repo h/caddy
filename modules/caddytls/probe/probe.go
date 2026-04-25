@@ -43,6 +43,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -344,46 +345,32 @@ func (p *Permission) dispatchViaHTTPApp(ctx context.Context, method, hostname st
 }
 
 // pickServer returns the http server through which the probe should
-// be dispatched: the (alphabetically first) server whose Listen
-// addresses cover the configured HTTPS port. Mirrors Caddy's physical
-// routing — a real on-demand request arrives on the HTTPS listener
-// and is routed to whichever Server bound it. The auto-generated
-// `remaining_auto_https_redirects` server listens on the HTTP port
-// only, so it's filtered out by the port match.
+// be dispatched. Mirrors Caddy's runtime flow: a real on-demand
+// request arrives on the HTTPS listener and is routed to whichever
+// Server owns that listener — the same predicate (HasListenerAddress)
+// that auto-https uses to find the redirect target. Among the (rare)
+// configurations where multiple servers each list the HTTPS port in
+// their Listen, we return the alphabetically-first one for
+// determinism; the OS won't actually let two servers bind the same
+// port simultaneously, so this only matters for the pre-bind config
+// view.
 func pickServer(app *caddyhttp.App) (*caddyhttp.Server, error) {
 	httpsPort := app.HTTPSPort
 	if httpsPort == 0 {
 		httpsPort = caddyhttp.DefaultHTTPSPort
 	}
+	addr := net.JoinHostPort("", strconv.Itoa(httpsPort))
 	names := make([]string, 0, len(app.Servers))
 	for name := range app.Servers {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		if serverListensOnPort(app.Servers[name], httpsPort) {
+		if app.Servers[name].HasListenerAddress(addr) {
 			return app.Servers[name], nil
 		}
 	}
-	return nil, fmt.Errorf("no http server listens on https port %d", httpsPort)
-}
-
-// serverListensOnPort reports whether any of srv.Listen's addresses
-// covers port. Addresses are parsed via caddy.ParseNetworkAddress so
-// port-range syntax (e.g. ":8080-8090") and host-prefixed forms (e.g.
-// "1.2.3.4:443") are handled the same way the rest of Caddy parses
-// them.
-func serverListensOnPort(srv *caddyhttp.Server, port int) bool {
-	for _, lnAddr := range srv.Listen {
-		na, err := caddy.ParseNetworkAddress(lnAddr)
-		if err != nil {
-			continue
-		}
-		if uint(port) >= na.StartPort && uint(port) <= na.EndPort {
-			return true
-		}
-	}
-	return false
+	return nil, fmt.Errorf("no http server has a listener on %s", addr)
 }
 
 // probeWriter is a tiny http.ResponseWriter that records the status
