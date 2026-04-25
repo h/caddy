@@ -1,0 +1,83 @@
+{
+	on_demand_tls {
+		permission reverse_proxy {
+			method GET
+			timeout 5s
+			spoof_check false
+			server srv0
+		}
+	}
+}
+
+*.example.com {
+	tls {
+		on_demand
+	}
+	reverse_proxy http://backend:8080
+}
+----------
+{
+	"apps": {
+		"http": {
+			"servers": {
+				"srv0": {
+					"listen": [
+						":443"
+					],
+					"routes": [
+						{
+							"match": [
+								{
+									"host": [
+										"*.example.com"
+									]
+								}
+							],
+							"handle": [
+								{
+									"handler": "subroute",
+									"routes": [
+										{
+											"handle": [
+												{
+													"handler": "reverse_proxy",
+													"upstreams": [
+														{
+															"dial": "backend:8080"
+														}
+													]
+												}
+											]
+										}
+									]
+								}
+							],
+							"terminal": true
+						}
+					]
+				}
+			}
+		},
+		"tls": {
+			"automation": {
+				"policies": [
+					{
+						"subjects": [
+							"*.example.com"
+						],
+						"on_demand": true
+					}
+				],
+				"on_demand": {
+					"permission": {
+						"method": "GET",
+						"module": "reverse_proxy",
+						"server": "srv0",
+						"spoof_check": false,
+						"timeout": 5000000000
+					}
+				}
+			}
+		}
+	}
+}
