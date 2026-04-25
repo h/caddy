@@ -17,6 +17,7 @@ package permissionproxy
 import (
 	"context"
 	"errors"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
 
@@ -411,10 +413,17 @@ func TestRandomizeFirstLabel_HandlesMultiLevel(t *testing.T) {
 }
 
 func TestRandomizeFirstLabel_GeneratesDifferentValues(t *testing.T) {
-	a := randomizeFirstLabel("foo.example.com")
-	b := randomizeFirstLabel("foo.example.com")
-	if a == b {
-		t.Errorf("expected two random calls to produce different results; both were %q", a)
+	// Sample multiple pairs and assert at least two distinct results.
+	// A single pair is theoretically flaky (1 in 36^16 ≈ 8e24); 8 samples
+	// makes the per-run failure probability completely negligible for any
+	// future RNG that's even loosely uniform.
+	const samples = 8
+	seen := make(map[string]struct{}, samples)
+	for i := 0; i < samples; i++ {
+		seen[randomizeFirstLabel("foo.example.com")] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Errorf("expected at least 2 distinct results across %d samples; got %d (%v)", samples, len(seen), seen)
 	}
 }
 
@@ -504,4 +513,184 @@ func TestModuleID(t *testing.T) {
 
 func TestImplementsOnDemandPermission(t *testing.T) {
 	var _ caddytls.OnDemandPermission = (*PermissionByReverseProxy)(nil)
+}
+
+// ============================================================
+// pickServer
+// ============================================================
+
+// httpsServer returns a minimal *caddyhttp.Server with non-empty
+// TLSConnPolicies — i.e., one that pickServer should treat as the
+// HTTPS server.
+func httpsServer() *caddyhttp.Server {
+	return &caddyhttp.Server{
+		TLSConnPolicies: caddytls.ConnectionPolicies{{}},
+	}
+}
+
+// httpRedirectServer returns a minimal *caddyhttp.Server without
+// TLSConnPolicies — i.e., a `remaining_auto_https_redirects`-style
+// server that pickServer should filter out.
+func httpRedirectServer() *caddyhttp.Server {
+	return &caddyhttp.Server{}
+}
+
+func TestPickServer_PrefersTLSServerOverRedirectServer(t *testing.T) {
+	// This is the canonical auto-HTTPS scenario. There's a user-defined
+	// HTTPS server (`srv0`) and an auto-generated HTTP redirect server
+	// (`remaining_auto_https_redirects`). The probe must always go to
+	// the HTTPS one regardless of map iteration order.
+	tlsSrv := httpsServer()
+	app := &caddyhttp.App{
+		Servers: map[string]*caddyhttp.Server{
+			"srv0":                           tlsSrv,
+			"remaining_auto_https_redirects": httpRedirectServer(),
+		},
+	}
+	// Run several times to defeat any chance the test could pass by
+	// luck of iteration order.
+	for i := 0; i < 20; i++ {
+		got, err := pickServer(app, "")
+		if err != nil {
+			t.Fatalf("pickServer error: %v", err)
+		}
+		if got != tlsSrv {
+			t.Fatalf("expected pickServer to choose the HTTPS server every time; got the redirect server")
+		}
+	}
+}
+
+func TestPickServer_ErrorsWhenNoTLSServer(t *testing.T) {
+	app := &caddyhttp.App{
+		Servers: map[string]*caddyhttp.Server{
+			"remaining_auto_https_redirects": httpRedirectServer(),
+		},
+	}
+	if _, err := pickServer(app, ""); err == nil {
+		t.Error("expected error when no server has TLSConnPolicies; got nil")
+	}
+}
+
+func TestPickServer_ErrorsWhenMultipleTLSServers(t *testing.T) {
+	app := &caddyhttp.App{
+		Servers: map[string]*caddyhttp.Server{
+			"srv0": httpsServer(),
+			"srv1": httpsServer(),
+		},
+	}
+	_, err := pickServer(app, "")
+	if err == nil {
+		t.Fatal("expected error with multiple TLS servers")
+	}
+	if !strings.Contains(err.Error(), "set `server`") {
+		t.Errorf("error should suggest setting the `server` field; got: %v", err)
+	}
+}
+
+func TestPickServer_ExplicitName_Selected(t *testing.T) {
+	tlsSrv := httpsServer()
+	app := &caddyhttp.App{
+		Servers: map[string]*caddyhttp.Server{
+			"srv0":                           tlsSrv,
+			"remaining_auto_https_redirects": httpRedirectServer(),
+		},
+	}
+	got, err := pickServer(app, "srv0")
+	if err != nil {
+		t.Fatalf("pickServer error: %v", err)
+	}
+	if got != tlsSrv {
+		t.Error("expected explicit name to return the named server")
+	}
+}
+
+func TestPickServer_ExplicitName_Missing(t *testing.T) {
+	app := &caddyhttp.App{
+		Servers: map[string]*caddyhttp.Server{
+			"srv0": httpsServer(),
+		},
+	}
+	if _, err := pickServer(app, "nope"); err == nil {
+		t.Error("expected error when explicit server name doesn't exist")
+	}
+}
+
+// ============================================================
+// probeWriter
+// ============================================================
+
+func TestProbeWriter_RecordsStatusFromWriteHeader(t *testing.T) {
+	pw := newProbeWriter()
+	pw.WriteHeader(404)
+	if !pw.handled {
+		t.Error("WriteHeader should mark handled=true")
+	}
+	if pw.status != 404 {
+		t.Errorf("status: got %d, want 404", pw.status)
+	}
+}
+
+func TestProbeWriter_WriteImpliesHandled200(t *testing.T) {
+	pw := newProbeWriter()
+	n, err := pw.Write([]byte("hello"))
+	if err != nil {
+		t.Fatalf("Write returned error: %v", err)
+	}
+	if n != 5 {
+		t.Errorf("Write: got n=%d, want 5", n)
+	}
+	if !pw.handled {
+		t.Error("Write should mark handled=true")
+	}
+	if pw.status != http.StatusOK {
+		t.Errorf("status without WriteHeader: got %d, want 200", pw.status)
+	}
+}
+
+func TestProbeWriter_WriteHeaderIsIdempotent(t *testing.T) {
+	pw := newProbeWriter()
+	pw.WriteHeader(201)
+	pw.WriteHeader(500)
+	if pw.status != 201 {
+		t.Errorf("status: got %d, want 201 (first call wins)", pw.status)
+	}
+}
+
+func TestProbeWriter_DiscardsBody(t *testing.T) {
+	pw := newProbeWriter()
+	pw.WriteHeader(200)
+	// Write a "large" payload; probeWriter must not buffer.
+	big := make([]byte, 1<<20) // 1 MiB
+	n, err := pw.Write(big)
+	if err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if n != len(big) {
+		t.Errorf("Write returned n=%d, want %d", n, len(big))
+	}
+	// probeWriter has no body field at all; we just need to confirm no panic
+	// and that Write honors the io.Writer contract (return len(p), nil).
+}
+
+func TestProbeWriter_NoCallsLeavesUnhandled(t *testing.T) {
+	pw := newProbeWriter()
+	if pw.handled {
+		t.Error("fresh probeWriter should have handled=false")
+	}
+	if pw.status != 0 {
+		t.Errorf("fresh probeWriter status: got %d, want 0", pw.status)
+	}
+	// Calling Header() alone shouldn't change anything.
+	_ = pw.Header()
+	if pw.handled {
+		t.Error("Header() should not mark handled")
+	}
+}
+
+func TestProbeWriter_HeaderReturnsMutableMap(t *testing.T) {
+	pw := newProbeWriter()
+	pw.Header().Set("X-Foo", "bar")
+	if got := pw.Header().Get("X-Foo"); got != "bar" {
+		t.Errorf("Header().Get: got %q, want bar", got)
+	}
 }

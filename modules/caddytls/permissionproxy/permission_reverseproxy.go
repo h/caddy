@@ -26,9 +26,10 @@
 // a randomized first label. If that also returns 2xx, the cert is
 // denied because the backend is not validating the hostname.
 //
-// If the matching automation policy already has an ACME issuer with a
-// DNS challenge configured (e.g. via `acme_dns`), the probe is skipped
-// entirely because DNS-01 doesn't need probe-based validation.
+// If the matching automation policy already has an issuer with a DNS
+// challenge configured (e.g. via `acme_dns` or ZeroSSL CNAME
+// validation), the probe is skipped entirely because DNS already
+// proves domain ownership.
 //
 // This package lives outside the caddytls package because it depends
 // on caddyhttp (which already depends on caddytls); the sub-package
@@ -38,12 +39,13 @@ package permissionproxy
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"time"
 
-	"github.com/caddyserver/certmagic"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -64,7 +66,8 @@ type PermissionByReverseProxy struct {
 	// HTTP method for the probe. Default: "HEAD".
 	Method string `json:"method,omitempty"`
 
-	// Probe timeout. Default: 10s.
+	// Probe timeout. Default: 10s. Applied independently to the
+	// real probe and the spoof probe.
 	Timeout caddy.Duration `json:"timeout,omitempty"`
 
 	// Whether to perform the random-subdomain spoof check.
@@ -72,8 +75,10 @@ type PermissionByReverseProxy struct {
 	SpoofCheck *bool `json:"spoof_check,omitempty"`
 
 	// Optional: explicit name of the http server to dispatch the
-	// probe through. If empty, the module picks the first server
-	// whose routes match the hostname.
+	// probe through. If empty, the module picks the server with
+	// non-empty TLS connection policies (i.e., the HTTPS server).
+	// Set this when you have multiple TLS servers and need to
+	// disambiguate.
 	Server string `json:"server,omitempty"`
 
 	ctx    caddy.Context
@@ -84,8 +89,10 @@ type PermissionByReverseProxy struct {
 	dnsCoversFn func(name string) bool
 }
 
-const defaultMethod = "HEAD"
-const defaultTimeout = 10 * time.Second
+const (
+	defaultMethod  = "HEAD"
+	defaultTimeout = 10 * time.Second
+)
 
 // CaddyModule returns the Caddy module information.
 func (PermissionByReverseProxy) CaddyModule() caddy.ModuleInfo {
@@ -95,10 +102,19 @@ func (PermissionByReverseProxy) CaddyModule() caddy.ModuleInfo {
 	}
 }
 
-// Provision wires up the production dispatch and DNS-challenge check.
+// Provision wires up the production dispatch and DNS-challenge check,
+// and validates configuration.
 func (p *PermissionByReverseProxy) Provision(ctx caddy.Context) error {
 	p.ctx = ctx
 	p.logger = ctx.Logger()
+
+	// Validate Method: anything that http.NewRequest accepts is fine, but
+	// we want to fail fast at provision rather than panic at first cert miss.
+	if p.Method != "" {
+		if _, err := http.NewRequest(p.Method, "/", nil); err != nil {
+			return fmt.Errorf("invalid probe method %q: %v", p.Method, err)
+		}
+	}
 
 	if p.dispatchFn == nil {
 		p.dispatchFn = p.dispatchViaHTTPApp
@@ -124,7 +140,6 @@ func (p *PermissionByReverseProxy) UnmarshalCaddyfile(d *caddyfile.Dispenser) er
 	if !d.Next() {
 		return nil
 	}
-	// No inline arguments are accepted.
 	if d.NextArg() {
 		return d.ArgErr()
 	}
@@ -185,28 +200,24 @@ func (p *PermissionByReverseProxy) UnmarshalCaddyfile(d *caddyfile.Dispenser) er
 
 // CertificateAllowed implements caddytls.OnDemandPermission.
 func (p *PermissionByReverseProxy) CertificateAllowed(ctx context.Context, name string) error {
-	// 1. DNS-01 short-circuit: if the matching automation policy has an
-	//    ACME issuer with a DNS challenge configured, we skip the probe.
-	//    DNS-01 already proves domain ownership via DNS API credentials.
+	// 1. DNS short-circuit: if the matching automation policy has an
+	//    issuer with DNS-based validation configured, skip the probe.
+	//    DNS proves domain ownership without needing a probe.
 	if p.dnsCoversFn != nil && p.dnsCoversFn(name) {
-		if c := p.logger.Check(zapcore.DebugLevel, "skipping reverse-proxy probe; policy has DNS-01 issuer"); c != nil {
+		if c := p.logger.Check(zapcore.DebugLevel, "skipping reverse-proxy probe; policy has DNS-validating issuer"); c != nil {
 			c.Write(zap.String("domain", name))
 		}
 		return nil
 	}
 
-	// 2. Real probe: GET/HEAD <name> through the configured handler chain.
-	probeCtx, cancel := context.WithTimeout(ctx, p.timeout())
-	defer cancel()
-
-	status, matched, err := p.dispatchFn(probeCtx, p.method(), name, p.Server)
+	// 2. Real probe. Each probe gets its own fresh deadline so that a
+	//    slow real probe doesn't starve the spoof probe of budget.
+	status, matched, err := p.runProbe(ctx, name)
 	if err != nil {
-		// Genuine errors (network failure, missing server) bubble up as
-		// errors so they're elevated above mere denials in the logs.
 		return fmt.Errorf("probing %s: %w", name, err)
 	}
 	if !matched {
-		return fmt.Errorf("%s: %w (no route matches host)", name, caddytls.ErrPermissionDenied)
+		return fmt.Errorf("%s: %w (no route handled the probe)", name, caddytls.ErrPermissionDenied)
 	}
 	if status < 200 || status > 299 {
 		return fmt.Errorf("%s: %w (probe got HTTP %d)", name, caddytls.ErrPermissionDenied, status)
@@ -216,14 +227,28 @@ func (p *PermissionByReverseProxy) CertificateAllowed(ctx context.Context, name 
 	//    2xx for that, it isn't validating the Host header — refuse.
 	if p.spoofCheckEnabled() {
 		spoofName := randomizeFirstLabel(name)
-		spoofStatus, spoofMatched, spoofErr := p.dispatchFn(probeCtx, p.method(), spoofName, p.Server)
-		if spoofErr == nil && spoofMatched && spoofStatus >= 200 && spoofStatus <= 299 {
+		spoofStatus, spoofMatched, spoofErr := p.runProbe(ctx, spoofName)
+		if spoofErr != nil {
+			// Spoof errors (incl. context.DeadlineExceeded) are observable
+			// but don't cause an outright denial. Make them visible at warn
+			// level so operators can spot starvation / backend trouble.
+			if c := p.logger.Check(zapcore.WarnLevel, "spoof probe errored; treating as spoof-denied"); c != nil {
+				c.Write(zap.String("domain", name), zap.String("spoof_domain", spoofName), zap.Error(spoofErr))
+			}
+		} else if spoofMatched && spoofStatus >= 200 && spoofStatus <= 299 {
 			return fmt.Errorf("%s: %w (Host-blind backend; spoof probe to %s returned HTTP %d)",
 				name, caddytls.ErrPermissionDenied, spoofName, spoofStatus)
 		}
 	}
 
 	return nil
+}
+
+// runProbe runs a single probe with its own fresh timeout deadline.
+func (p *PermissionByReverseProxy) runProbe(parent context.Context, hostname string) (int, bool, error) {
+	probeCtx, cancel := context.WithTimeout(parent, p.timeout())
+	defer cancel()
+	return p.dispatchFn(probeCtx, p.method(), hostname, p.Server)
 }
 
 func (p *PermissionByReverseProxy) method() string {
@@ -250,30 +275,55 @@ func (p *PermissionByReverseProxy) spoofCheckEnabled() bool {
 // randomizeFirstLabel replaces the leftmost DNS label of name with a
 // cryptographically random 16-character lowercase alphanumeric string.
 // If name has no dots, the entire string is replaced.
+//
+// Uses rejection sampling so each character is uniformly distributed
+// across the alphabet (no modulo bias).
 func randomizeFirstLabel(name string) string {
 	const labelLen = 16
 	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-	buf := make([]byte, labelLen)
-	if _, err := rand.Read(buf); err != nil {
-		// crypto/rand never returns an error in practice; if it ever did,
-		// fall back to a deterministic-but-unique value.
-		buf = []byte("aaaaaaaaaaaaaaaa")
+	const alphaLen = byte(len(alphabet)) // 36
+	// Largest multiple of alphaLen that fits in a byte; bytes >= this
+	// value are rejected to avoid modulo bias.
+	const cutoff = byte(256 - (256 % int(alphaLen)))
+
+	out := make([]byte, 0, labelLen)
+	buf := make([]byte, labelLen*2) // size buf bigger than needed; refill if exhausted
+	for len(out) < labelLen {
+		if _, err := rand.Read(buf); err != nil {
+			// crypto/rand is documented to never fail on supported platforms.
+			// A deterministic fallback would let an attacker predict the
+			// spoof name, so panic instead.
+			panic(fmt.Sprintf("permissionproxy: crypto/rand failure: %v", err))
+		}
+		for _, b := range buf {
+			if b >= cutoff {
+				continue // reject biased bytes
+			}
+			out = append(out, alphabet[b%alphaLen])
+			if len(out) == labelLen {
+				break
+			}
+		}
 	}
-	out := make([]byte, labelLen)
-	for i, b := range buf {
-		out[i] = alphabet[int(b)%len(alphabet)]
-	}
-	rand := string(out)
+	randomLabel := string(out)
 
 	if i := strings.IndexByte(name, '.'); i >= 0 {
-		return rand + name[i:]
+		return randomLabel + name[i:]
 	}
-	return rand
+	return randomLabel
 }
 
-// dispatchViaHTTPApp is the production dispatcher: it locates an HTTP
-// server in the http app whose routes match the hostname, then sends a
-// synthetic request through that server's full handler chain.
+// dispatchViaHTTPApp is the production dispatcher: it picks the HTTPS
+// server in the http app and sends a synthetic request through its full
+// handler chain. The result is interpreted as:
+//
+//   - status: HTTP status returned by the chain (or 0 if the chain
+//     wrote nothing)
+//   - matched: true iff a handler in the chain actually wrote a
+//     response (i.e., some route's matchers fired). false means the
+//     hostname was unrouted, which the caller treats as denial.
+//   - err: a real probe failure (no http app, no eligible server,
+//     handler panic). Distinct from a denial.
 func (p *PermissionByReverseProxy) dispatchViaHTTPApp(ctx context.Context, method, hostname, serverName string) (int, bool, error) {
 	httpAppIface, err := p.ctx.AppIfConfigured("http")
 	if err != nil || httpAppIface == nil {
@@ -284,77 +334,120 @@ func (p *PermissionByReverseProxy) dispatchViaHTTPApp(ctx context.Context, metho
 		return 0, false, fmt.Errorf("http app has unexpected type %T", httpAppIface)
 	}
 
-	srv, matched := pickServer(httpApp, hostname, serverName)
-	if srv == nil {
-		if serverName != "" {
-			return 0, false, fmt.Errorf("no http server named %q", serverName)
-		}
-		// No matching server is a denial-level outcome (no error), so the
-		// module can return ErrPermissionDenied rather than a probe error.
-		return 0, false, nil
-	}
-	if !matched {
-		// Server was selected by name (or there's only one server) but
-		// none of its routes match the hostname.
-		return 0, false, nil
+	srv, err := pickServer(httpApp, serverName)
+	if err != nil {
+		return 0, false, err
 	}
 
 	req := httptest.NewRequest(method, "/", nil)
 	req.Host = hostname
 	req.URL.Host = hostname
 	req.URL.Scheme = "http"
-	req.RemoteAddr = "127.0.0.1:0"
+	// Use 0.0.0.0:0 instead of 127.0.0.1:0 so handlers that key off
+	// remote_ip (rate limiters, IP allowlists) can't accidentally
+	// treat the probe as a privileged loopback request.
+	req.RemoteAddr = "0.0.0.0:0"
 	req = req.WithContext(ctx)
 
-	rec := httptest.NewRecorder()
-	srv.ServeHTTP(rec, req)
-	return rec.Code, true, nil
+	pw := newProbeWriter()
+
+	// Recover from any panic in the handler chain so a bad downstream
+	// handler can't tear down the certmagic decision goroutine.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				if c := p.logger.Check(zapcore.ErrorLevel, "handler panicked during probe; treating as denial"); c != nil {
+					c.Write(zap.String("domain", hostname), zap.Any("panic", r))
+				}
+			}
+		}()
+		srv.ServeHTTP(pw, req)
+	}()
+
+	if !pw.handled {
+		// No handler in the chain wrote anything. Treat as no-route-match.
+		return 0, false, nil
+	}
+	return pw.status, true, nil
 }
 
-// pickServer returns the http server that should service a probe for
-// hostname, plus whether any of that server's routes have a Host
-// matcher that covers hostname. If serverName is non-empty, only that
-// server is considered.
-func pickServer(app *caddyhttp.App, hostname, serverName string) (*caddyhttp.Server, bool) {
+// pickServer returns the http server through which the probe should be
+// dispatched. If serverName is non-empty, only that server is
+// considered. Otherwise the module picks the server with non-empty
+// TLSConnPolicies — i.e., the HTTPS server. The auto-generated
+// `remaining_auto_https_redirects` server has no TLSConnPolicies so
+// it's filtered out cleanly.
+//
+// If multiple servers have TLSConnPolicies (genuine multi-TLS-server
+// configs), an error is returned asking the operator to set Server
+// explicitly. In single-TLS-server configs (the common case) selection
+// is deterministic.
+func pickServer(app *caddyhttp.App, serverName string) (*caddyhttp.Server, error) {
 	if serverName != "" {
 		srv, ok := app.Servers[serverName]
 		if !ok {
-			return nil, false
+			return nil, fmt.Errorf("no http server named %q", serverName)
 		}
-		return srv, serverMatchesHost(srv, hostname)
+		return srv, nil
 	}
-	for _, srv := range app.Servers {
-		if serverMatchesHost(srv, hostname) {
-			return srv, true
+
+	var (
+		picked  *caddyhttp.Server
+		matches []string
+	)
+	for name, srv := range app.Servers {
+		if len(srv.TLSConnPolicies) == 0 {
+			continue
 		}
+		picked = srv
+		matches = append(matches, name)
 	}
-	return nil, false
+	switch len(matches) {
+	case 0:
+		return nil, errors.New("no http server with TLS connection policies; set `server` to disambiguate")
+	case 1:
+		return picked, nil
+	default:
+		return nil, fmt.Errorf("multiple http servers have TLS connection policies (%v); set `server` to disambiguate", matches)
+	}
 }
 
-// serverMatchesHost walks srv's routes looking for any caddyhttp.MatchHost
-// matcher whose patterns cover hostname.
-func serverMatchesHost(srv *caddyhttp.Server, hostname string) bool {
-	for _, route := range srv.Routes {
-		for _, ms := range route.MatcherSets {
-			for _, m := range ms {
-				hm, ok := m.(*caddyhttp.MatchHost)
-				if !ok {
-					continue
-				}
-				for _, pattern := range *hm {
-					if certmagic.MatchWildcard(hostname, pattern) {
-						return true
-					}
-				}
-			}
-		}
+// probeWriter is a tiny http.ResponseWriter that records the status
+// code and whether any handler actually responded, while discarding
+// body bytes. Replaces httptest.NewRecorder so we don't buffer
+// (potentially large) response bodies in memory on every cert miss.
+type probeWriter struct {
+	headers http.Header
+	status  int
+	handled bool
+}
+
+func newProbeWriter() *probeWriter {
+	return &probeWriter{headers: make(http.Header)}
+}
+
+func (pw *probeWriter) Header() http.Header { return pw.headers }
+
+func (pw *probeWriter) WriteHeader(code int) {
+	if !pw.handled {
+		pw.status = code
+		pw.handled = true
 	}
-	return false
+}
+
+func (pw *probeWriter) Write(p []byte) (int, error) {
+	if !pw.handled {
+		pw.status = http.StatusOK
+		pw.handled = true
+	}
+	return len(p), nil
 }
 
 // dnsChallengeCoversName checks whether the automation policy that
-// applies to name has any ACME issuer with a DNS challenge configured.
-// If so, the probe is skipped because DNS-01 already validates ownership.
+// applies to name has an issuer that proves ownership via DNS — either
+// an ACME issuer with a DNS challenge configured, or a ZeroSSL issuer
+// with CNAME validation configured. If so, the probe is skipped
+// because DNS already validates ownership.
 func (p *PermissionByReverseProxy) dnsChallengeCoversName(name string) bool {
 	tlsAppIface, err := p.ctx.AppIfConfigured("tls")
 	if err != nil || tlsAppIface == nil {
@@ -369,12 +462,15 @@ func (p *PermissionByReverseProxy) dnsChallengeCoversName(name string) bool {
 		return false
 	}
 	for _, iss := range ap.Issuers {
-		acmeIss, ok := iss.(*caddytls.ACMEIssuer)
-		if !ok {
-			continue
-		}
-		if acmeIss.Challenges != nil && acmeIss.Challenges.DNS != nil {
-			return true
+		switch v := iss.(type) {
+		case *caddytls.ACMEIssuer:
+			if v.Challenges != nil && v.Challenges.DNS != nil {
+				return true
+			}
+		case *caddytls.ZeroSSLIssuer:
+			if v.CNAMEValidation != nil {
+				return true
+			}
 		}
 	}
 	return false
@@ -385,4 +481,5 @@ var (
 	_ caddytls.OnDemandPermission = (*PermissionByReverseProxy)(nil)
 	_ caddy.Provisioner           = (*PermissionByReverseProxy)(nil)
 	_ caddyfile.Unmarshaler       = (*PermissionByReverseProxy)(nil)
+	_ http.ResponseWriter         = (*probeWriter)(nil)
 )
