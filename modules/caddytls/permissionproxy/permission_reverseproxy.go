@@ -39,7 +39,7 @@ package permissionproxy
 import (
 	"context"
 	"crypto/rand"
-	"errors"
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -342,7 +342,13 @@ func (p *PermissionByReverseProxy) dispatchViaHTTPApp(ctx context.Context, metho
 	req := httptest.NewRequest(method, "/", nil)
 	req.Host = hostname
 	req.URL.Host = hostname
-	req.URL.Scheme = "http"
+	// Probe as if the request arrived on the HTTPS listener: scheme=https
+	// plus a non-nil TLS state. This mirrors what a real client request
+	// to the on-demand-protected hostname would look like, so any
+	// MatchProtocol("https") matchers in the user's chain behave the
+	// same way they would for the live request.
+	req.URL.Scheme = "https"
+	req.TLS = &tls.ConnectionState{ServerName: hostname}
 	// Use 0.0.0.0:0 instead of 127.0.0.1:0 so handlers that key off
 	// remote_ip (rate limiters, IP allowlists) can't accidentally
 	// treat the probe as a privileged loopback request.
@@ -371,17 +377,21 @@ func (p *PermissionByReverseProxy) dispatchViaHTTPApp(ctx context.Context, metho
 	return pw.status, true, nil
 }
 
-// pickServer returns the http server through which the probe should be
-// dispatched. If serverName is non-empty, only that server is
-// considered. Otherwise the module picks the server with non-empty
-// TLSConnPolicies — i.e., the HTTPS server. The auto-generated
-// `remaining_auto_https_redirects` server has no TLSConnPolicies so
-// it's filtered out cleanly.
+// pickServer returns the http server through which the probe should
+// be dispatched, mirroring Caddy's physical routing: a real request
+// for an on-demand-protected hostname arrives on the HTTPS listener
+// and is routed to whichever Server bound that port. We do the same
+// here — pick the server (if any) whose Listen addresses cover
+// `app.HTTPSPort`. The auto-generated `remaining_auto_https_redirects`
+// server listens on the HTTP port and is therefore filtered out
+// naturally.
 //
-// If multiple servers have TLSConnPolicies (genuine multi-TLS-server
-// configs), an error is returned asking the operator to set Server
-// explicitly. In single-TLS-server configs (the common case) selection
-// is deterministic.
+// If serverName is non-empty, that explicit server is used regardless
+// of its listening ports.
+//
+// If multiple servers listen on the HTTPS port (genuine multi-TLS-
+// server configs), an error is returned asking the operator to set
+// Server explicitly.
 func pickServer(app *caddyhttp.App, serverName string) (*caddyhttp.Server, error) {
 	if serverName != "" {
 		srv, ok := app.Servers[serverName]
@@ -391,12 +401,17 @@ func pickServer(app *caddyhttp.App, serverName string) (*caddyhttp.Server, error
 		return srv, nil
 	}
 
+	httpsPort := app.HTTPSPort
+	if httpsPort == 0 {
+		httpsPort = caddyhttp.DefaultHTTPSPort
+	}
+
 	var (
 		picked  *caddyhttp.Server
 		matches []string
 	)
 	for name, srv := range app.Servers {
-		if len(srv.TLSConnPolicies) == 0 {
+		if !serverListensOnPort(srv, httpsPort) {
 			continue
 		}
 		picked = srv
@@ -404,12 +419,30 @@ func pickServer(app *caddyhttp.App, serverName string) (*caddyhttp.Server, error
 	}
 	switch len(matches) {
 	case 0:
-		return nil, errors.New("no http server with TLS connection policies; set `server` to disambiguate")
+		return nil, fmt.Errorf("no http server listens on https port %d; set `server` to disambiguate", httpsPort)
 	case 1:
 		return picked, nil
 	default:
-		return nil, fmt.Errorf("multiple http servers have TLS connection policies (%v); set `server` to disambiguate", matches)
+		return nil, fmt.Errorf("multiple http servers listen on https port %d (%v); set `server` to disambiguate", httpsPort, matches)
 	}
+}
+
+// serverListensOnPort reports whether any of srv.Listen's addresses
+// covers port. Addresses are parsed via caddy.ParseNetworkAddress so
+// port-range syntax (e.g. ":8080-8090") and host-prefixed forms (e.g.
+// "1.2.3.4:443") are handled the same way the rest of Caddy parses
+// them.
+func serverListensOnPort(srv *caddyhttp.Server, port int) bool {
+	for _, lnAddr := range srv.Listen {
+		na, err := caddy.ParseNetworkAddress(lnAddr)
+		if err != nil {
+			continue
+		}
+		if uint(port) >= na.StartPort && uint(port) <= na.EndPort {
+			return true
+		}
+	}
+	return false
 }
 
 // probeWriter is a tiny http.ResponseWriter that records the status

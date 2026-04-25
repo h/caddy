@@ -519,34 +519,34 @@ func TestImplementsOnDemandPermission(t *testing.T) {
 // pickServer
 // ============================================================
 
-// httpsServer returns a minimal *caddyhttp.Server with non-empty
-// TLSConnPolicies — i.e., one that pickServer should treat as the
-// HTTPS server.
+// httpsServer returns a minimal *caddyhttp.Server that listens on
+// `:443` (the default HTTPS port) — i.e., one that pickServer should
+// treat as the HTTPS server.
 func httpsServer() *caddyhttp.Server {
-	return &caddyhttp.Server{
-		TLSConnPolicies: caddytls.ConnectionPolicies{{}},
-	}
+	return &caddyhttp.Server{Listen: []string{":443"}}
 }
 
-// httpRedirectServer returns a minimal *caddyhttp.Server without
-// TLSConnPolicies — i.e., a `remaining_auto_https_redirects`-style
+// httpRedirectServer returns a minimal *caddyhttp.Server that listens
+// on `:80` only — i.e., a `remaining_auto_https_redirects`-style
 // server that pickServer should filter out.
 func httpRedirectServer() *caddyhttp.Server {
-	return &caddyhttp.Server{}
+	return &caddyhttp.Server{Listen: []string{":80"}}
 }
 
-func TestPickServer_PrefersTLSServerOverRedirectServer(t *testing.T) {
-	// This is the canonical auto-HTTPS scenario. There's a user-defined
-	// HTTPS server (`srv0`) and an auto-generated HTTP redirect server
-	// (`remaining_auto_https_redirects`). The probe must always go to
-	// the HTTPS one regardless of map iteration order.
+func httpsAppWith(servers map[string]*caddyhttp.Server) *caddyhttp.App {
+	return &caddyhttp.App{Servers: servers}
+}
+
+func TestPickServer_PrefersHTTPSServerOverRedirectServer(t *testing.T) {
+	// The canonical auto-HTTPS scenario. The user-defined HTTPS server
+	// (`srv0`) listens on :443 and the auto-generated redirect server
+	// (`remaining_auto_https_redirects`) listens on :80. The probe must
+	// always go to the HTTPS one regardless of map iteration order.
 	tlsSrv := httpsServer()
-	app := &caddyhttp.App{
-		Servers: map[string]*caddyhttp.Server{
-			"srv0":                           tlsSrv,
-			"remaining_auto_https_redirects": httpRedirectServer(),
-		},
-	}
+	app := httpsAppWith(map[string]*caddyhttp.Server{
+		"srv0":                           tlsSrv,
+		"remaining_auto_https_redirects": httpRedirectServer(),
+	})
 	// Run several times to defeat any chance the test could pass by
 	// luck of iteration order.
 	for i := 0; i < 20; i++ {
@@ -560,27 +560,58 @@ func TestPickServer_PrefersTLSServerOverRedirectServer(t *testing.T) {
 	}
 }
 
-func TestPickServer_ErrorsWhenNoTLSServer(t *testing.T) {
+func TestPickServer_HonorsCustomHTTPSPort(t *testing.T) {
+	// User overrides https_port to 9443. The HTTPS server should be
+	// selected based on the configured port, not the default 443.
+	tlsSrv := &caddyhttp.Server{Listen: []string{":9443"}}
 	app := &caddyhttp.App{
+		HTTPSPort: 9443,
 		Servers: map[string]*caddyhttp.Server{
-			"remaining_auto_https_redirects": httpRedirectServer(),
+			"srv0":                           tlsSrv,
+			"remaining_auto_https_redirects": &caddyhttp.Server{Listen: []string{":9080"}},
 		},
 	}
-	if _, err := pickServer(app, ""); err == nil {
-		t.Error("expected error when no server has TLSConnPolicies; got nil")
+	got, err := pickServer(app, "")
+	if err != nil {
+		t.Fatalf("pickServer error: %v", err)
+	}
+	if got != tlsSrv {
+		t.Error("expected the server listening on the custom https_port")
 	}
 }
 
-func TestPickServer_ErrorsWhenMultipleTLSServers(t *testing.T) {
+func TestPickServer_HonorsPortRangeListen(t *testing.T) {
+	tlsSrv := &caddyhttp.Server{Listen: []string{":8000-9000"}}
 	app := &caddyhttp.App{
-		Servers: map[string]*caddyhttp.Server{
-			"srv0": httpsServer(),
-			"srv1": httpsServer(),
-		},
+		HTTPSPort: 8443,
+		Servers:   map[string]*caddyhttp.Server{"srv0": tlsSrv},
 	}
+	got, err := pickServer(app, "")
+	if err != nil {
+		t.Fatalf("pickServer error: %v", err)
+	}
+	if got != tlsSrv {
+		t.Error("expected port-range listen to be matched")
+	}
+}
+
+func TestPickServer_ErrorsWhenNoServerListensOnHTTPS(t *testing.T) {
+	app := httpsAppWith(map[string]*caddyhttp.Server{
+		"remaining_auto_https_redirects": httpRedirectServer(),
+	})
+	if _, err := pickServer(app, ""); err == nil {
+		t.Error("expected error when no server listens on https port; got nil")
+	}
+}
+
+func TestPickServer_ErrorsWhenMultipleHTTPSServers(t *testing.T) {
+	app := httpsAppWith(map[string]*caddyhttp.Server{
+		"srv0": httpsServer(),
+		"srv1": httpsServer(),
+	})
 	_, err := pickServer(app, "")
 	if err == nil {
-		t.Fatal("expected error with multiple TLS servers")
+		t.Fatal("expected error with multiple https servers")
 	}
 	if !strings.Contains(err.Error(), "set `server`") {
 		t.Errorf("error should suggest setting the `server` field; got: %v", err)
@@ -588,30 +619,33 @@ func TestPickServer_ErrorsWhenMultipleTLSServers(t *testing.T) {
 }
 
 func TestPickServer_ExplicitName_Selected(t *testing.T) {
-	tlsSrv := httpsServer()
-	app := &caddyhttp.App{
-		Servers: map[string]*caddyhttp.Server{
-			"srv0":                           tlsSrv,
-			"remaining_auto_https_redirects": httpRedirectServer(),
-		},
-	}
-	got, err := pickServer(app, "srv0")
+	// Explicit `server` overrides the port-based filter — even a server
+	// that doesn't listen on the HTTPS port can be chosen this way.
+	tlsSrv := httpRedirectServer() // intentionally not on :443
+	app := httpsAppWith(map[string]*caddyhttp.Server{
+		"srv0":                           httpsServer(),
+		"remaining_auto_https_redirects": tlsSrv,
+	})
+	got, err := pickServer(app, "remaining_auto_https_redirects")
 	if err != nil {
 		t.Fatalf("pickServer error: %v", err)
 	}
 	if got != tlsSrv {
-		t.Error("expected explicit name to return the named server")
+		t.Error("expected explicit name to return the named server regardless of port")
 	}
 }
 
 func TestPickServer_ExplicitName_Missing(t *testing.T) {
-	app := &caddyhttp.App{
-		Servers: map[string]*caddyhttp.Server{
-			"srv0": httpsServer(),
-		},
-	}
+	app := httpsAppWith(map[string]*caddyhttp.Server{"srv0": httpsServer()})
 	if _, err := pickServer(app, "nope"); err == nil {
 		t.Error("expected error when explicit server name doesn't exist")
+	}
+}
+
+func TestServerListensOnPort_RejectsMalformedListen(t *testing.T) {
+	srv := &caddyhttp.Server{Listen: []string{"not a valid address"}}
+	if serverListensOnPort(srv, 443) {
+		t.Error("malformed listen address should not match")
 	}
 }
 
