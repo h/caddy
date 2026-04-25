@@ -770,25 +770,45 @@ func (t *TLS) getConfigForName(name string) *certmagic.Config {
 }
 
 // applyOnDemandPermissionDefault wires the reverse_proxy permission
-// module as the default when any automation policy enables on-demand
-// but no permission module (or legacy 'ask') is configured. This lets
-// a wildcard zone be served safely with no extra global config:
+// module as the default when an on-demand policy *would otherwise have
+// failed the safety check* — i.e., the policy is wildcard-or-default
+// (no subject filter, or includes a "*" wildcard) and uses public
+// issuers. This lets a wildcard zone be served safely with no extra
+// global config:
 //
 //	*.example.com {
 //	    tls { on_demand }
 //	    reverse_proxy http://backend:8080
 //	}
 //
-// The reverse_proxy module validates by probing the configured upstream
-// through Caddy's own handler chain.
+// Explicit-subject policies (e.g. `example.com { tls { on_demand } }`)
+// were never gated by the missing-permission check before this PR, so
+// we don't auto-inject a probe for them — they continue to behave as
+// they did before.
 func (t *TLS) applyOnDemandPermissionDefault() {
 	if t.Automation == nil {
 		return
 	}
 	var needsOnDemand bool
 	for _, ap := range t.Automation.Policies {
-		if ap.OnDemand {
+		if !ap.OnDemand {
+			continue
+		}
+		// Match the existing safety-check trigger in automation.go:302:
+		// only inject if there's no subject filter (catch-all) or the
+		// subjects include a wildcard. Use SubjectsRaw because policies
+		// haven't been provisioned yet at this point.
+		if len(ap.SubjectsRaw) == 0 {
 			needsOnDemand = true
+			break
+		}
+		for _, s := range ap.SubjectsRaw {
+			if strings.HasPrefix(s, "*") {
+				needsOnDemand = true
+				break
+			}
+		}
+		if needsOnDemand {
 			break
 		}
 	}
@@ -799,6 +819,7 @@ func (t *TLS) applyOnDemandPermissionDefault() {
 		t.Automation.OnDemand = new(OnDemandConfig)
 	}
 	if t.Automation.OnDemand.PermissionRaw == nil && t.Automation.OnDemand.Ask == "" {
+		// Keep this module ID in sync with permissionproxy.PermissionByReverseProxy.CaddyModule().ID.
 		t.Automation.OnDemand.PermissionRaw = json.RawMessage(`{"module":"reverse_proxy"}`)
 	}
 }
@@ -808,7 +829,12 @@ func (t *TLS) applyOnDemandPermissionDefault() {
 // around the package-private lookup so other modules (notably
 // on-demand permission modules) can introspect issuer configuration
 // for a domain without re-implementing the matching logic.
+//
+// Returns nil if Automation is unset (e.g., called before Provision).
 func (t *TLS) GetAutomationPolicyForName(name string) *AutomationPolicy {
+	if t.Automation == nil {
+		return nil
+	}
 	return t.getAutomationPolicyForName(name)
 }
 

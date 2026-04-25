@@ -38,7 +38,9 @@ func TestAutomationPolicyImplicitTailscaleManagersOnlyCatchAll(t *testing.T) {
 	}
 }
 
-func TestApplyOnDemandPermissionDefault_InjectsReverseProxy(t *testing.T) {
+func TestApplyOnDemandPermissionDefault_InjectsForCatchAllPolicy(t *testing.T) {
+	// No SubjectsRaw: catch-all policy. The existing safety check would
+	// have errored without a permission module; we now auto-inject.
 	tlsApp := &TLS{
 		Automation: &AutomationConfig{
 			Policies: []*AutomationPolicy{{OnDemand: true}},
@@ -52,6 +54,63 @@ func TestApplyOnDemandPermissionDefault_InjectsReverseProxy(t *testing.T) {
 	got := string(tlsApp.Automation.OnDemand.PermissionRaw)
 	if !strings.Contains(got, `"module":"reverse_proxy"`) {
 		t.Errorf("expected default permission module to be reverse_proxy; got PermissionRaw=%s", got)
+	}
+}
+
+func TestApplyOnDemandPermissionDefault_InjectsForWildcardPolicy(t *testing.T) {
+	tlsApp := &TLS{
+		Automation: &AutomationConfig{
+			Policies: []*AutomationPolicy{{
+				OnDemand:    true,
+				SubjectsRaw: []string{"*.example.com"},
+			}},
+		},
+	}
+	tlsApp.applyOnDemandPermissionDefault()
+
+	if tlsApp.Automation.OnDemand == nil ||
+		!strings.Contains(string(tlsApp.Automation.OnDemand.PermissionRaw), `"module":"reverse_proxy"`) {
+		t.Errorf("expected reverse_proxy default for wildcard policy; got %+v", tlsApp.Automation.OnDemand)
+	}
+}
+
+func TestApplyOnDemandPermissionDefault_DoesNotInjectForExplicitSubject(t *testing.T) {
+	// Explicit-subject on-demand policies were never gated by the
+	// missing-permission safety check, so we shouldn't auto-inject for
+	// them. The existing behavior (no permission module, no probe) is
+	// preserved.
+	tlsApp := &TLS{
+		Automation: &AutomationConfig{
+			Policies: []*AutomationPolicy{{
+				OnDemand:    true,
+				SubjectsRaw: []string{"example.com", "foo.example.com"},
+			}},
+		},
+	}
+	tlsApp.applyOnDemandPermissionDefault()
+
+	if tlsApp.Automation.OnDemand != nil {
+		t.Errorf("expected no auto-injection for explicit-subject policy; got %+v",
+			tlsApp.Automation.OnDemand)
+	}
+}
+
+func TestApplyOnDemandPermissionDefault_InjectsWhenAnyPolicyIsWildcard(t *testing.T) {
+	// Mix of explicit and wildcard policies — any wildcard triggers injection.
+	tlsApp := &TLS{
+		Automation: &AutomationConfig{
+			Policies: []*AutomationPolicy{
+				{OnDemand: true, SubjectsRaw: []string{"explicit.example.com"}},
+				{OnDemand: true, SubjectsRaw: []string{"*.wild.example.com"}},
+			},
+		},
+	}
+	tlsApp.applyOnDemandPermissionDefault()
+
+	if tlsApp.Automation.OnDemand == nil ||
+		!strings.Contains(string(tlsApp.Automation.OnDemand.PermissionRaw), `"module":"reverse_proxy"`) {
+		t.Errorf("expected reverse_proxy default when at least one policy is wildcard; got %+v",
+			tlsApp.Automation.OnDemand)
 	}
 }
 
