@@ -767,6 +767,15 @@ func (t *TLS) getConfigForName(name string) *certmagic.Config {
 	return ap.magic
 }
 
+// GetAutomationPolicyForName returns the automation policy that
+// applies to the given subject name. It is a thin exported wrapper
+// around the package-private lookup so other modules (notably
+// on-demand permission modules) can introspect issuer configuration
+// for a domain without re-implementing the matching logic.
+func (t *TLS) GetAutomationPolicyForName(name string) *AutomationPolicy {
+	return t.getAutomationPolicyForName(name)
+}
+
 // getAutomationPolicyForName returns the first matching automation policy
 // for the given subject name. If no matching policy can be found, the
 // default policy is used, depending on whether the name qualifies for a
