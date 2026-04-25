@@ -137,13 +137,13 @@ func TestE2E_DispatchProbesRealHandlerChain(t *testing.T) {
 		t.Fatalf("provisioning permission module: %v", err)
 	}
 
-	// 5. Disable host-specificity check for this scenario: the stub
+	// 5. Disable random-host probe for this scenario: the stub
 	//    upstream *intentionally* returns 200 only for one specific
 	//    Host, so the random-host probe would correctly see a 404 and
 	//    not deny — but we already have separate tests for the
-	//    host-specific check matrix.
+	//    random-host probe matrix.
 	fl := false
-	p.VerifyHostSpecific = &fl
+	p.RandomHostProbe = &fl
 
 	t.Run("known host — allowed", func(t *testing.T) {
 		if err := p.CertificateAllowed(context.Background(), knownHost); err != nil {
@@ -566,7 +566,7 @@ func TestE2E_StaticCert_BypassesProbe(t *testing.T) {
 // on-demand handshake), subsequent handshakes for the same hostname
 // reuse the cache and don't re-trigger the probe.
 //
-// The oracle is again the upstream stub; with VerifyHostSpecific
+// The oracle is again the upstream stub; with RandomHostProbe
 // disabled (so we get exactly one probe request per cert miss), the
 // test asserts the upstream sees exactly 1 request after two
 // handshakes — proof that the second hit the cache.
@@ -627,7 +627,7 @@ func TestE2E_CachedCert_BypassesProbeOnSecondHandshake(t *testing.T) {
 					"on_demand": {
 						"permission": {
 							"module": "reverse_proxy",
-							"verify_host_specific": false
+							"random_host_probe": false
 						}
 					}
 				}

@@ -70,7 +70,7 @@ func (s *stubDispatch) callCount() int {
 }
 
 // newPerm produces a PermissionByReverseProxy with sensible defaults
-// for testing: HEAD method, 1s timeout, host-specificity check on, no
+// for testing: HEAD method, 1s timeout, random-host probe on, no
 // DNS coverage, and a logger that drops everything.
 func newPerm(t *testing.T, dispatch *stubDispatch) *PermissionByReverseProxy {
 	t.Helper()
@@ -78,7 +78,7 @@ func newPerm(t *testing.T, dispatch *stubDispatch) *PermissionByReverseProxy {
 	return &PermissionByReverseProxy{
 		Method:             "HEAD",
 		Timeout:            caddy.Duration(time.Second),
-		VerifyHostSpecific: &tr,
+		RandomHostProbe: &tr,
 		logger:             zap.NewNop(),
 		dispatchFn:         dispatch.fn(),
 		dnsCoversFn:        func(string) bool { return false },
@@ -92,14 +92,14 @@ func always(status int, matched bool, err error) func(dispatchCall) dispatchResp
 	}
 }
 
-// bySpoof returns one response for the canonical name and a different one
-// for the spoofed (random-first-label) probe.
-func bySpoof(canonical string, real, spoof dispatchResp) func(dispatchCall) dispatchResp {
+// byRandomHost returns one response for the canonical name and a different
+// one for the random-host probe (which uses a randomized first label).
+func byRandomHost(canonical string, real, randomHost dispatchResp) func(dispatchCall) dispatchResp {
 	return func(c dispatchCall) dispatchResp {
 		if c.hostname == canonical {
 			return real
 		}
-		return spoof
+		return randomHost
 	}
 }
 
@@ -108,10 +108,10 @@ func bySpoof(canonical string, real, spoof dispatchResp) func(dispatchCall) disp
 // ============================================================
 
 func TestCertificateAllowed_AllowsValidSubdomain(t *testing.T) {
-	stub := &stubDispatch{respond: bySpoof(
+	stub := &stubDispatch{respond: byRandomHost(
 		"foo.example.com",
 		dispatchResp{status: 200, matched: true},
-		dispatchResp{status: 404, matched: true}, // spoof denied
+		dispatchResp{status: 404, matched: true}, // probe denied
 	)}
 	p := newPerm(t, stub)
 
@@ -119,7 +119,7 @@ func TestCertificateAllowed_AllowsValidSubdomain(t *testing.T) {
 		t.Fatalf("expected allow, got error: %v", err)
 	}
 	if got := stub.callCount(); got != 2 {
-		t.Errorf("expected 2 dispatch calls (real + spoof), got %d", got)
+		t.Errorf("expected 2 dispatch calls (real + random-host), got %d", got)
 	}
 }
 
@@ -132,7 +132,7 @@ func TestCertificateAllowed_DeniesOn404(t *testing.T) {
 		t.Fatalf("expected ErrPermissionDenied, got %v", err)
 	}
 	if got := stub.callCount(); got != 1 {
-		t.Errorf("expected 1 dispatch call (no spoof on denial), got %d", got)
+		t.Errorf("expected 1 dispatch call (no random-host probe on denial), got %d", got)
 	}
 }
 
@@ -186,10 +186,10 @@ func TestCertificateAllowed_PropagatesDispatchError(t *testing.T) {
 }
 
 // ============================================================
-// CertificateAllowed: spoof check
+// CertificateAllowed: random-host probe
 // ============================================================
 
-func TestCertificateAllowed_DeniesWhenSpoofProbeAlsoSucceeds(t *testing.T) {
+func TestCertificateAllowed_DeniesWhenRandomHostProbeAlsoSucceeds(t *testing.T) {
 	// Backend returns 200 for any host — classic Host-blind misconfiguration.
 	stub := &stubDispatch{respond: always(200, true, nil)}
 	p := newPerm(t, stub)
@@ -199,31 +199,31 @@ func TestCertificateAllowed_DeniesWhenSpoofProbeAlsoSucceeds(t *testing.T) {
 		t.Fatalf("expected ErrPermissionDenied when backend ignores Host header, got %v", err)
 	}
 	if got := stub.callCount(); got != 2 {
-		t.Errorf("expected 2 dispatch calls (real + spoof) before denying, got %d", got)
+		t.Errorf("expected 2 dispatch calls (real + random-host) before denying, got %d", got)
 	}
 	if stub.calls[0].hostname == stub.calls[1].hostname {
-		t.Errorf("spoof probe should use a different hostname; both were %q", stub.calls[0].hostname)
+		t.Errorf("random-host probe should use a different hostname; both were %q", stub.calls[0].hostname)
 	}
 }
 
-func TestCertificateAllowed_AllowsWhenVerifyHostSpecificDisabled(t *testing.T) {
+func TestCertificateAllowed_AllowsWhenRandomHostProbeDisabled(t *testing.T) {
 	// Even if backend would return 200 for any host, with the
-	// host-specificity check disabled we allow.
+	// random-host probe disabled we allow.
 	stub := &stubDispatch{respond: always(200, true, nil)}
 	fl := false
 	p := newPerm(t, stub)
-	p.VerifyHostSpecific = &fl
+	p.RandomHostProbe = &fl
 
 	if err := p.CertificateAllowed(context.Background(), "foo.example.com"); err != nil {
-		t.Fatalf("expected allow with verify_host_specific=false, got: %v", err)
+		t.Fatalf("expected allow with random_host_probe=false, got: %v", err)
 	}
 	if got := stub.callCount(); got != 1 {
-		t.Errorf("expected 1 dispatch call when host-specificity check is disabled, got %d", got)
+		t.Errorf("expected 1 dispatch call when random-host probe is disabled, got %d", got)
 	}
 }
 
-func TestCertificateAllowed_AllowsWhenSpoofProbeReturnsNon2xx(t *testing.T) {
-	stub := &stubDispatch{respond: bySpoof(
+func TestCertificateAllowed_AllowsWhenRandomHostProbeReturnsNon2xx(t *testing.T) {
+	stub := &stubDispatch{respond: byRandomHost(
 		"foo.example.com",
 		dispatchResp{status: 200, matched: true},
 		dispatchResp{status: 404, matched: true},
@@ -235,10 +235,10 @@ func TestCertificateAllowed_AllowsWhenSpoofProbeReturnsNon2xx(t *testing.T) {
 	}
 }
 
-func TestCertificateAllowed_AllowsWhenSpoofProbeErrors(t *testing.T) {
-	// Real probe 2xx, spoof probe network error → backend isn't responding to fake
+func TestCertificateAllowed_AllowsWhenRandomHostProbeErrors(t *testing.T) {
+	// Real probe 2xx, random-host probe network error → backend isn't responding to fake
 	// hosts at all, which is *good*. Allow the cert.
-	stub := &stubDispatch{respond: bySpoof(
+	stub := &stubDispatch{respond: byRandomHost(
 		"foo.example.com",
 		dispatchResp{status: 200, matched: true},
 		dispatchResp{status: 0, matched: true, err: errors.New("connection refused")},
@@ -246,7 +246,7 @@ func TestCertificateAllowed_AllowsWhenSpoofProbeErrors(t *testing.T) {
 	p := newPerm(t, stub)
 
 	if err := p.CertificateAllowed(context.Background(), "foo.example.com"); err != nil {
-		t.Fatalf("expected allow when spoof probe errors, got: %v", err)
+		t.Fatalf("expected allow when random-host probe errors, got: %v", err)
 	}
 }
 
@@ -268,7 +268,7 @@ func TestCertificateAllowed_AllowsWhenDNSChallengeConfigured(t *testing.T) {
 }
 
 func TestCertificateAllowed_ProbesWhenDNSChallengeNotConfigured(t *testing.T) {
-	stub := &stubDispatch{respond: bySpoof(
+	stub := &stubDispatch{respond: byRandomHost(
 		"foo.example.com",
 		dispatchResp{status: 200, matched: true},
 		dispatchResp{status: 404, matched: true},
@@ -310,7 +310,7 @@ func TestCertificateAllowed_AppliesTimeout(t *testing.T) {
 }
 
 // ============================================================
-// Method, timeout, and verify_host_specific defaults
+// Method, timeout, and random_host_probe defaults
 // ============================================================
 
 func TestMethodDefault(t *testing.T) {
@@ -341,26 +341,26 @@ func TestTimeoutOverride(t *testing.T) {
 	}
 }
 
-func TestVerifyHostSpecificEnabled_NilDefaultsTrue(t *testing.T) {
+func TestRandomHostProbeEnabled_NilDefaultsTrue(t *testing.T) {
 	p := &PermissionByReverseProxy{}
-	if !p.verifyHostSpecificEnabled() {
-		t.Error("expected host-specificity check to default to enabled when VerifyHostSpecific is nil")
+	if !p.randomHostProbeEnabled() {
+		t.Error("expected random-host probe to default to enabled when RandomHostProbe is nil")
 	}
 }
 
-func TestVerifyHostSpecificEnabled_ExplicitTrue(t *testing.T) {
+func TestRandomHostProbeEnabled_ExplicitTrue(t *testing.T) {
 	tr := true
-	p := &PermissionByReverseProxy{VerifyHostSpecific: &tr}
-	if !p.verifyHostSpecificEnabled() {
-		t.Error("expected host-specificity check to be enabled when VerifyHostSpecific=true")
+	p := &PermissionByReverseProxy{RandomHostProbe: &tr}
+	if !p.randomHostProbeEnabled() {
+		t.Error("expected random-host probe to be enabled when RandomHostProbe=true")
 	}
 }
 
-func TestVerifyHostSpecificEnabled_ExplicitFalse(t *testing.T) {
+func TestRandomHostProbeEnabled_ExplicitFalse(t *testing.T) {
 	fl := false
-	p := &PermissionByReverseProxy{VerifyHostSpecific: &fl}
-	if p.verifyHostSpecificEnabled() {
-		t.Error("expected host-specificity check to be disabled when VerifyHostSpecific=false")
+	p := &PermissionByReverseProxy{RandomHostProbe: &fl}
+	if p.randomHostProbeEnabled() {
+		t.Error("expected random-host probe to be disabled when RandomHostProbe=false")
 	}
 }
 
@@ -433,8 +433,8 @@ func TestUnmarshalCaddyfile_EmptyBlock(t *testing.T) {
 	if p.method() != "HEAD" {
 		t.Errorf("default method after empty parse: got %q want HEAD", p.method())
 	}
-	if !p.verifyHostSpecificEnabled() {
-		t.Error("verify_host_specific should default to true after empty parse")
+	if !p.randomHostProbeEnabled() {
+		t.Error("random_host_probe should default to true after empty parse")
 	}
 }
 
@@ -442,7 +442,7 @@ func TestUnmarshalCaddyfile_FullBlock(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`reverse_proxy {
         method GET
         timeout 5s
-        verify_host_specific false
+        random_host_probe false
     }`)
 	p := &PermissionByReverseProxy{}
 	if err := p.UnmarshalCaddyfile(d); err != nil {
@@ -454,8 +454,8 @@ func TestUnmarshalCaddyfile_FullBlock(t *testing.T) {
 	if time.Duration(p.Timeout) != 5*time.Second {
 		t.Errorf("Timeout: got %v, want 5s", time.Duration(p.Timeout))
 	}
-	if p.VerifyHostSpecific == nil || *p.VerifyHostSpecific {
-		t.Errorf("VerifyHostSpecific: got %v, want explicit false", p.VerifyHostSpecific)
+	if p.RandomHostProbe == nil || *p.RandomHostProbe {
+		t.Errorf("RandomHostProbe: got %v, want explicit false", p.RandomHostProbe)
 	}
 }
 

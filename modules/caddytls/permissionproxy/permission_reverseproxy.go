@@ -22,7 +22,7 @@
 //
 // To defend against upstreams that don't validate the Host header
 // (which would otherwise let an attacker mint unbounded certs against
-// a wildcard zone), the module also runs a host-specificity check: a
+// a wildcard zone), the module also runs a random-host probe: a
 // second probe with a randomized first label. If that also returns
 // 2xx, the upstream is treated as host-blind and the certificate is
 // denied.
@@ -84,7 +84,7 @@ type PermissionByReverseProxy struct {
 	// certificates.
 	//
 	// Default: true.
-	VerifyHostSpecific *bool `json:"verify_host_specific,omitempty"`
+	RandomHostProbe *bool `json:"random_host_probe,omitempty"`
 
 	ctx    caddy.Context
 	logger *zap.Logger
@@ -135,7 +135,7 @@ func (p *PermissionByReverseProxy) Provision(ctx caddy.Context) error {
 //	permission reverse_proxy {
 //	    method <method>
 //	    timeout <duration>
-//	    verify_host_specific <bool>
+//	    random_host_probe <bool>
 //	}
 //
 // All sub-directives are optional.
@@ -169,7 +169,7 @@ func (p *PermissionByReverseProxy) UnmarshalCaddyfile(d *caddyfile.Dispenser) er
 			if d.NextArg() {
 				return d.ArgErr()
 			}
-		case "verify_host_specific":
+		case "random_host_probe":
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
@@ -181,9 +181,9 @@ func (p *PermissionByReverseProxy) UnmarshalCaddyfile(d *caddyfile.Dispenser) er
 			case "false", "off", "no":
 				b = false
 			default:
-				return d.Errf("verify_host_specific must be true/false, got %q", val)
+				return d.Errf("random_host_probe must be true/false, got %q", val)
 			}
-			p.VerifyHostSpecific = &b
+			p.RandomHostProbe = &b
 			if d.NextArg() {
 				return d.ArgErr()
 			}
@@ -207,7 +207,7 @@ func (p *PermissionByReverseProxy) CertificateAllowed(ctx context.Context, name 
 	}
 
 	// 2. Real probe. Each probe gets its own fresh deadline so that a
-	//    slow real probe doesn't starve the host-specificity probe of
+	//    slow real probe doesn't starve the random-host probe of
 	//    budget.
 	status, matched, err := p.runProbe(ctx, name)
 	if err != nil {
@@ -223,14 +223,14 @@ func (p *PermissionByReverseProxy) CertificateAllowed(ctx context.Context, name 
 	// 3. Host-specificity check: probe a randomized variant. If the
 	//    upstream returns 2xx for an unrelated random hostname too, it
 	//    isn't really validating the Host header — refuse the cert.
-	if p.verifyHostSpecificEnabled() {
+	if p.randomHostProbeEnabled() {
 		fakeName := randomizeFirstLabel(name)
 		fakeStatus, fakeMatched, fakeErr := p.runProbe(ctx, fakeName)
 		if fakeErr != nil {
 			// Errors here (incl. context.DeadlineExceeded) are observable
 			// but don't cause an outright denial. Surface at warn level
 			// so operators can spot starvation / upstream trouble.
-			if c := p.logger.Check(zapcore.WarnLevel, "host-specificity probe errored; treating as denied"); c != nil {
+			if c := p.logger.Check(zapcore.WarnLevel, "random-host probe errored; treating as denied"); c != nil {
 				c.Write(zap.String("domain", name), zap.String("fake_domain", fakeName), zap.Error(fakeErr))
 			}
 		} else if fakeMatched && fakeStatus >= 200 && fakeStatus <= 299 {
@@ -263,11 +263,11 @@ func (p *PermissionByReverseProxy) timeout() time.Duration {
 	return time.Duration(p.Timeout)
 }
 
-func (p *PermissionByReverseProxy) verifyHostSpecificEnabled() bool {
-	if p.VerifyHostSpecific == nil {
+func (p *PermissionByReverseProxy) randomHostProbeEnabled() bool {
+	if p.RandomHostProbe == nil {
 		return true
 	}
-	return *p.VerifyHostSpecific
+	return *p.RandomHostProbe
 }
 
 // randomizeFirstLabel replaces the leftmost DNS label of name with a
@@ -290,7 +290,7 @@ func randomizeFirstLabel(name string) string {
 		if _, err := rand.Read(buf); err != nil {
 			// crypto/rand is documented to never fail on supported platforms.
 			// A deterministic fallback would let an attacker predict the
-			// spoof name, so panic instead.
+			// randomized hostname, so panic instead.
 			panic(fmt.Sprintf("permissionproxy: crypto/rand failure: %v", err))
 		}
 		for _, b := range buf {
