@@ -425,6 +425,29 @@ func parseOptOnDemand(d *caddyfile.Dispenser, _ any) (any, error) {
 			}
 			ond.PermissionRaw = caddyconfig.JSONModuleObject(perm, "module", modName, nil)
 
+		case "probe":
+			// Sugar for the tls.permission.route_probe module: probes the
+			// configured upstream through Caddy's own routes to decide
+			// whether on-demand cert issuance is allowed for a hostname.
+			// Sits at the same level as `ask`: a top-level decision
+			// mechanism for on_demand_tls.
+			if ond == nil {
+				ond = new(caddytls.OnDemandConfig)
+			}
+			if ond.PermissionRaw != nil {
+				return nil, d.Err("on-demand TLS permission module (or 'ask') already specified")
+			}
+			const modName = "probe"
+			unm, err := caddyfile.UnmarshalModule(d, "tls.permission."+modName)
+			if err != nil {
+				return nil, err
+			}
+			perm, ok := unm.(caddytls.OnDemandPermission)
+			if !ok {
+				return nil, d.Errf("module tls.permission.%s (%T) is not an on-demand TLS permission module", modName, unm)
+			}
+			ond.PermissionRaw = caddyconfig.JSONModuleObject(perm, "module", modName, nil)
+
 		case "interval":
 			return nil, d.Errf("the on_demand_tls 'interval' option is no longer supported, remove it from your config")
 

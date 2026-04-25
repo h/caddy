@@ -458,7 +458,7 @@ redirServersLoop:
 			srv := app.Servers[srvName]
 			// only look at servers which listen on an address which
 			// we want to add redirects to
-			if !srv.hasListenerAddress(redirServerAddr) {
+			if !srv.HasListenerAddress(redirServerAddr) {
 				continue
 			}
 

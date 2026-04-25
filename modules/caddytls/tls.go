@@ -273,6 +273,8 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	t.applyOnDemandPermissionDefault()
+
 	// on-demand permission module
 	if t.Automation != nil && t.Automation.OnDemand != nil && t.Automation.OnDemand.PermissionRaw != nil {
 		if t.Automation.OnDemand.Ask != "" {
@@ -765,6 +767,75 @@ func (t *TLS) AddAutomationPolicy(ap *AutomationPolicy) error {
 func (t *TLS) getConfigForName(name string) *certmagic.Config {
 	ap := t.getAutomationPolicyForName(name)
 	return ap.magic
+}
+
+// applyOnDemandPermissionDefault wires the probe permission
+// module as the default when an on-demand policy *would otherwise have
+// failed the safety check* — i.e., the policy is wildcard-or-default
+// (no subject filter, or includes a "*" wildcard) and uses public
+// issuers. This lets a wildcard zone be served safely with no extra
+// global config:
+//
+//	*.example.com {
+//	    tls { on_demand }
+//	    reverse_proxy http://backend:8080
+//	}
+//
+// Explicit-subject policies (e.g. `example.com { tls { on_demand } }`)
+// were never gated by the missing-permission check before this PR, so
+// we don't auto-inject a probe for them — they continue to behave as
+// they did before.
+func (t *TLS) applyOnDemandPermissionDefault() {
+	if t.Automation == nil {
+		return
+	}
+	var needsOnDemand bool
+	for _, ap := range t.Automation.Policies {
+		if !ap.OnDemand {
+			continue
+		}
+		// Match the existing safety-check trigger in automation.go:302:
+		// only inject if there's no subject filter (catch-all) or the
+		// subjects include a wildcard. Use SubjectsRaw because policies
+		// haven't been provisioned yet at this point.
+		if len(ap.SubjectsRaw) == 0 {
+			needsOnDemand = true
+			break
+		}
+		for _, s := range ap.SubjectsRaw {
+			if strings.HasPrefix(s, "*") {
+				needsOnDemand = true
+				break
+			}
+		}
+		if needsOnDemand {
+			break
+		}
+	}
+	if !needsOnDemand {
+		return
+	}
+	if t.Automation.OnDemand == nil {
+		t.Automation.OnDemand = new(OnDemandConfig)
+	}
+	if t.Automation.OnDemand.PermissionRaw == nil && t.Automation.OnDemand.Ask == "" {
+		// Keep this module ID in sync with probe.Permission.CaddyModule().ID.
+		t.Automation.OnDemand.PermissionRaw = json.RawMessage(`{"module":"probe"}`)
+	}
+}
+
+// GetAutomationPolicyForName returns the automation policy that
+// applies to the given subject name. It is a thin exported wrapper
+// around the package-private lookup so other modules (notably
+// on-demand permission modules) can introspect issuer configuration
+// for a domain without re-implementing the matching logic.
+//
+// Returns nil if Automation is unset (e.g., called before Provision).
+func (t *TLS) GetAutomationPolicyForName(name string) *AutomationPolicy {
+	if t.Automation == nil {
+		return nil
+	}
+	return t.getAutomationPolicyForName(name)
 }
 
 // getAutomationPolicyForName returns the first matching automation policy

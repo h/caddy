@@ -543,11 +543,16 @@ func (s *Server) listenersUseAnyPortOtherThan(otherPort int) bool {
 	return false
 }
 
-// hasListenerAddress returns true if s has a listener
+// HasListenerAddress returns true if s has a listener
 // at the given address fullAddr. Currently, fullAddr
 // must represent exactly one socket address (port
-// ranges are not supported)
-func (s *Server) hasListenerAddress(fullAddr string) bool {
+// ranges are not supported).
+//
+// Useful for routing decisions that need to find which
+// server would receive a connection on a known address —
+// for example, the on-demand-TLS probe picking the HTTPS
+// server, or auto-https inserting redirect routes.
+func (s *Server) HasListenerAddress(fullAddr string) bool {
 	laddrs, err := caddy.ParseNetworkAddress(fullAddr)
 	if err != nil {
 		return false
