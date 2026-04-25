@@ -273,6 +273,8 @@ func (t *TLS) Provision(ctx caddy.Context) error {
 		}
 	}
 
+	t.applyOnDemandPermissionDefault()
+
 	// on-demand permission module
 	if t.Automation != nil && t.Automation.OnDemand != nil && t.Automation.OnDemand.PermissionRaw != nil {
 		if t.Automation.OnDemand.Ask != "" {
@@ -765,6 +767,40 @@ func (t *TLS) AddAutomationPolicy(ap *AutomationPolicy) error {
 func (t *TLS) getConfigForName(name string) *certmagic.Config {
 	ap := t.getAutomationPolicyForName(name)
 	return ap.magic
+}
+
+// applyOnDemandPermissionDefault wires the reverse_proxy permission
+// module as the default when any automation policy enables on-demand
+// but no permission module (or legacy 'ask') is configured. This lets
+// a wildcard zone be served safely with no extra global config:
+//
+//	*.example.com {
+//	    tls { on_demand }
+//	    reverse_proxy http://backend:8080
+//	}
+//
+// The reverse_proxy module validates by probing the configured upstream
+// through Caddy's own handler chain.
+func (t *TLS) applyOnDemandPermissionDefault() {
+	if t.Automation == nil {
+		return
+	}
+	var needsOnDemand bool
+	for _, ap := range t.Automation.Policies {
+		if ap.OnDemand {
+			needsOnDemand = true
+			break
+		}
+	}
+	if !needsOnDemand {
+		return
+	}
+	if t.Automation.OnDemand == nil {
+		t.Automation.OnDemand = new(OnDemandConfig)
+	}
+	if t.Automation.OnDemand.PermissionRaw == nil && t.Automation.OnDemand.Ask == "" {
+		t.Automation.OnDemand.PermissionRaw = json.RawMessage(`{"module":"reverse_proxy"}`)
+	}
 }
 
 // GetAutomationPolicyForName returns the automation policy that
