@@ -169,13 +169,13 @@ func TestE2E_DispatchProbesRealHandlerChain(t *testing.T) {
 	})
 }
 
-// TestE2E_PickServersOnRealCaddyfileLayout proves that the
-// listen-port-based pickServers filter works against the *actual*
+// TestE2E_PickServerOnRealCaddyfileLayout proves that the
+// listen-port-based pickServer filter works against the *actual*
 // http app structure that Caddy's adapter + auto-HTTPS produce — not
 // just hand-built fixtures. If a future Caddy refactor renames the
 // redirect server, changes its listen port, or restructures the
 // HTTPS server's listeners, this test will catch it.
-func TestE2E_PickServersOnRealCaddyfileLayout(t *testing.T) {
+func TestE2E_PickServerOnRealCaddyfileLayout(t *testing.T) {
 	httpsPort := freePort(t)
 	httpPort := freePort(t)
 
