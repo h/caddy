@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package permissionproxy
+package routeprobe
 
 import (
 	"context"
@@ -69,13 +69,13 @@ func (s *stubDispatch) callCount() int {
 	return len(s.calls)
 }
 
-// newPerm produces a PermissionByReverseProxy with sensible defaults
+// newPerm produces a PermissionByRouteProbe with sensible defaults
 // for testing: HEAD method, 1s timeout, random-host probe on, no
 // DNS coverage, and a logger that drops everything.
-func newPerm(t *testing.T, dispatch *stubDispatch) *PermissionByReverseProxy {
+func newPerm(t *testing.T, dispatch *stubDispatch) *PermissionByRouteProbe {
 	t.Helper()
 	tr := true
-	return &PermissionByReverseProxy{
+	return &PermissionByRouteProbe{
 		Method:             "HEAD",
 		Timeout:            caddy.Duration(time.Second),
 		RandomHostProbe: &tr,
@@ -314,35 +314,35 @@ func TestCertificateAllowed_AppliesTimeout(t *testing.T) {
 // ============================================================
 
 func TestMethodDefault(t *testing.T) {
-	p := &PermissionByReverseProxy{}
+	p := &PermissionByRouteProbe{}
 	if got := p.method(); got != "HEAD" {
 		t.Errorf("default method: got %q, want %q", got, "HEAD")
 	}
 }
 
 func TestMethodOverride(t *testing.T) {
-	p := &PermissionByReverseProxy{Method: "GET"}
+	p := &PermissionByRouteProbe{Method: "GET"}
 	if got := p.method(); got != "GET" {
 		t.Errorf("method override: got %q, want %q", got, "GET")
 	}
 }
 
 func TestTimeoutDefault(t *testing.T) {
-	p := &PermissionByReverseProxy{}
+	p := &PermissionByRouteProbe{}
 	if got := p.timeout(); got != 10*time.Second {
 		t.Errorf("default timeout: got %v, want 10s", got)
 	}
 }
 
 func TestTimeoutOverride(t *testing.T) {
-	p := &PermissionByReverseProxy{Timeout: caddy.Duration(3 * time.Second)}
+	p := &PermissionByRouteProbe{Timeout: caddy.Duration(3 * time.Second)}
 	if got := p.timeout(); got != 3*time.Second {
 		t.Errorf("timeout override: got %v, want 3s", got)
 	}
 }
 
 func TestRandomHostProbeEnabled_NilDefaultsTrue(t *testing.T) {
-	p := &PermissionByReverseProxy{}
+	p := &PermissionByRouteProbe{}
 	if !p.randomHostProbeEnabled() {
 		t.Error("expected random-host probe to default to enabled when RandomHostProbe is nil")
 	}
@@ -350,7 +350,7 @@ func TestRandomHostProbeEnabled_NilDefaultsTrue(t *testing.T) {
 
 func TestRandomHostProbeEnabled_ExplicitTrue(t *testing.T) {
 	tr := true
-	p := &PermissionByReverseProxy{RandomHostProbe: &tr}
+	p := &PermissionByRouteProbe{RandomHostProbe: &tr}
 	if !p.randomHostProbeEnabled() {
 		t.Error("expected random-host probe to be enabled when RandomHostProbe=true")
 	}
@@ -358,7 +358,7 @@ func TestRandomHostProbeEnabled_ExplicitTrue(t *testing.T) {
 
 func TestRandomHostProbeEnabled_ExplicitFalse(t *testing.T) {
 	fl := false
-	p := &PermissionByReverseProxy{RandomHostProbe: &fl}
+	p := &PermissionByRouteProbe{RandomHostProbe: &fl}
 	if p.randomHostProbeEnabled() {
 		t.Error("expected random-host probe to be disabled when RandomHostProbe=false")
 	}
@@ -426,7 +426,7 @@ func TestRandomizeFirstLabel_HandlesBareHostname(t *testing.T) {
 func TestUnmarshalCaddyfile_EmptyBlock(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`reverse_proxy {
     }`)
-	p := &PermissionByReverseProxy{}
+	p := &PermissionByRouteProbe{}
 	if err := p.UnmarshalCaddyfile(d); err != nil {
 		t.Fatalf("expected empty block to parse cleanly; got: %v", err)
 	}
@@ -444,7 +444,7 @@ func TestUnmarshalCaddyfile_FullBlock(t *testing.T) {
         timeout 5s
         random_host_probe false
     }`)
-	p := &PermissionByReverseProxy{}
+	p := &PermissionByRouteProbe{}
 	if err := p.UnmarshalCaddyfile(d); err != nil {
 		t.Fatalf("UnmarshalCaddyfile: %v", err)
 	}
@@ -463,7 +463,7 @@ func TestUnmarshalCaddyfile_UnknownDirective(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`reverse_proxy {
         wat unknown
     }`)
-	p := &PermissionByReverseProxy{}
+	p := &PermissionByRouteProbe{}
 	if err := p.UnmarshalCaddyfile(d); err == nil {
 		t.Error("expected error for unknown directive, got nil")
 	}
@@ -474,14 +474,14 @@ func TestUnmarshalCaddyfile_UnknownDirective(t *testing.T) {
 // ============================================================
 
 func TestModuleID(t *testing.T) {
-	info := PermissionByReverseProxy{}.CaddyModule()
-	if info.ID != "tls.permission.reverse_proxy" {
-		t.Errorf("module ID: got %q, want tls.permission.reverse_proxy", info.ID)
+	info := PermissionByRouteProbe{}.CaddyModule()
+	if info.ID != "tls.permission.route_probe" {
+		t.Errorf("module ID: got %q, want tls.permission.route_probe", info.ID)
 	}
 }
 
 func TestImplementsOnDemandPermission(t *testing.T) {
-	var _ caddytls.OnDemandPermission = (*PermissionByReverseProxy)(nil)
+	var _ caddytls.OnDemandPermission = (*PermissionByRouteProbe)(nil)
 }
 
 // ============================================================

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package permissionproxy registers an on-demand TLS permission module
-// (`tls.permission.reverse_proxy`) that decides whether a domain may
+// Package routeprobe registers an on-demand TLS permission module
+// (`tls.permission.route_probe`) that decides whether a domain may
 // have a certificate issued by dispatching a synthetic HTTP request
 // through Caddy's own handler chain — i.e., the same route +
 // reverse_proxy pipeline a real client would hit. If the configured
@@ -35,7 +35,7 @@
 // This package lives outside the caddytls package because it depends
 // on caddyhttp (which already depends on caddytls); the sub-package
 // avoids the import cycle.
-package permissionproxy
+package routeprobe
 
 import (
 	"context"
@@ -58,13 +58,13 @@ import (
 )
 
 func init() {
-	caddy.RegisterModule(PermissionByReverseProxy{})
+	caddy.RegisterModule(PermissionByRouteProbe{})
 }
 
-// PermissionByReverseProxy validates an on-demand TLS request by
+// PermissionByRouteProbe validates an on-demand TLS request by
 // dispatching a synthetic HTTP request through Caddy's own handler
 // chain. See the package doc for full details.
-type PermissionByReverseProxy struct {
+type PermissionByRouteProbe struct {
 	// HTTP method for the probe. Default: "HEAD".
 	Method string `json:"method,omitempty"`
 
@@ -100,16 +100,16 @@ const (
 )
 
 // CaddyModule returns the Caddy module information.
-func (PermissionByReverseProxy) CaddyModule() caddy.ModuleInfo {
+func (PermissionByRouteProbe) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "tls.permission.reverse_proxy",
-		New: func() caddy.Module { return new(PermissionByReverseProxy) },
+		ID:  "tls.permission.route_probe",
+		New: func() caddy.Module { return new(PermissionByRouteProbe) },
 	}
 }
 
 // Provision wires up the production dispatch and DNS-challenge check,
 // and validates configuration.
-func (p *PermissionByReverseProxy) Provision(ctx caddy.Context) error {
+func (p *PermissionByRouteProbe) Provision(ctx caddy.Context) error {
 	p.ctx = ctx
 	p.logger = ctx.Logger()
 
@@ -130,16 +130,19 @@ func (p *PermissionByReverseProxy) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler. This is the
+// generic-permission form; the canonical form is the top-level
+// `route_probe` directive in the `on_demand_tls` global options
+// block, which produces the same JSON.
 //
-//	permission reverse_proxy {
+//	permission route_probe {
 //	    method <method>
 //	    timeout <duration>
 //	    random_host_probe <bool>
 //	}
 //
 // All sub-directives are optional.
-func (p *PermissionByReverseProxy) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+func (p *PermissionByRouteProbe) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// Consume the module name token (first call to Next() returns true on it).
 	if !d.Next() {
 		return nil
@@ -195,7 +198,7 @@ func (p *PermissionByReverseProxy) UnmarshalCaddyfile(d *caddyfile.Dispenser) er
 }
 
 // CertificateAllowed implements caddytls.OnDemandPermission.
-func (p *PermissionByReverseProxy) CertificateAllowed(ctx context.Context, name string) error {
+func (p *PermissionByRouteProbe) CertificateAllowed(ctx context.Context, name string) error {
 	// 1. DNS short-circuit: if the matching automation policy has an
 	//    issuer with DNS-based validation configured, skip the probe.
 	//    DNS proves domain ownership without needing a probe.
@@ -243,27 +246,27 @@ func (p *PermissionByReverseProxy) CertificateAllowed(ctx context.Context, name 
 }
 
 // runProbe runs a single probe with its own fresh timeout deadline.
-func (p *PermissionByReverseProxy) runProbe(parent context.Context, hostname string) (int, bool, error) {
+func (p *PermissionByRouteProbe) runProbe(parent context.Context, hostname string) (int, bool, error) {
 	probeCtx, cancel := context.WithTimeout(parent, p.timeout())
 	defer cancel()
 	return p.dispatchFn(probeCtx, p.method(), hostname)
 }
 
-func (p *PermissionByReverseProxy) method() string {
+func (p *PermissionByRouteProbe) method() string {
 	if p.Method == "" {
 		return defaultMethod
 	}
 	return p.Method
 }
 
-func (p *PermissionByReverseProxy) timeout() time.Duration {
+func (p *PermissionByRouteProbe) timeout() time.Duration {
 	if p.Timeout == 0 {
 		return defaultTimeout
 	}
 	return time.Duration(p.Timeout)
 }
 
-func (p *PermissionByReverseProxy) randomHostProbeEnabled() bool {
+func (p *PermissionByRouteProbe) randomHostProbeEnabled() bool {
 	if p.RandomHostProbe == nil {
 		return true
 	}
@@ -291,7 +294,7 @@ func randomizeFirstLabel(name string) string {
 			// crypto/rand is documented to never fail on supported platforms.
 			// A deterministic fallback would let an attacker predict the
 			// randomized hostname, so panic instead.
-			panic(fmt.Sprintf("permissionproxy: crypto/rand failure: %v", err))
+			panic(fmt.Sprintf("routeprobe: crypto/rand failure: %v", err))
 		}
 		for _, b := range buf {
 			if b >= cutoff {
@@ -322,7 +325,7 @@ func randomizeFirstLabel(name string) string {
 //     hostname was unrouted, which the caller treats as denial.
 //   - err: a real probe failure (no http app, no eligible server,
 //     handler panic). Distinct from a denial.
-func (p *PermissionByReverseProxy) dispatchViaHTTPApp(ctx context.Context, method, hostname string) (int, bool, error) {
+func (p *PermissionByRouteProbe) dispatchViaHTTPApp(ctx context.Context, method, hostname string) (int, bool, error) {
 	httpAppIface, err := p.ctx.AppIfConfigured("http")
 	if err != nil || httpAppIface == nil {
 		return 0, false, fmt.Errorf("http app not available: %v", err)
@@ -479,7 +482,7 @@ func (pw *probeWriter) Write(p []byte) (int, error) {
 // an ACME issuer with a DNS challenge configured, or a ZeroSSL issuer
 // with CNAME validation configured. If so, the probe is skipped
 // because DNS already validates ownership.
-func (p *PermissionByReverseProxy) dnsChallengeCoversName(name string) bool {
+func (p *PermissionByRouteProbe) dnsChallengeCoversName(name string) bool {
 	tlsAppIface, err := p.ctx.AppIfConfigured("tls")
 	if err != nil || tlsAppIface == nil {
 		return false
@@ -509,8 +512,8 @@ func (p *PermissionByReverseProxy) dnsChallengeCoversName(name string) bool {
 
 // Interface guards
 var (
-	_ caddytls.OnDemandPermission = (*PermissionByReverseProxy)(nil)
-	_ caddy.Provisioner           = (*PermissionByReverseProxy)(nil)
-	_ caddyfile.Unmarshaler       = (*PermissionByReverseProxy)(nil)
+	_ caddytls.OnDemandPermission = (*PermissionByRouteProbe)(nil)
+	_ caddy.Provisioner           = (*PermissionByRouteProbe)(nil)
+	_ caddyfile.Unmarshaler       = (*PermissionByRouteProbe)(nil)
 	_ http.ResponseWriter         = (*probeWriter)(nil)
 )

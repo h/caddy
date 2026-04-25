@@ -1,6 +1,6 @@
 {
 	on_demand_tls {
-		permission reverse_proxy {
+		route_probe {
 			method GET
 			timeout 5s
 			random_host_probe false
@@ -70,7 +70,7 @@
 				"on_demand": {
 					"permission": {
 						"method": "GET",
-						"module": "reverse_proxy",
+						"module": "route_probe",
 						"random_host_probe": false,
 						"timeout": 5000000000
 					}

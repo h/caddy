@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package permissionproxy
+package routeprobe
 
 import (
 	"context"
@@ -127,7 +127,7 @@ func TestE2E_DispatchProbesRealHandlerChain(t *testing.T) {
 	// 4. Construct the permission module against the running context.
 	//    pickServers will find srv0 by HTTPS port match (the http app
 	//    has https_port = srvPort, and srv0 listens on srvPort).
-	p := &PermissionByReverseProxy{
+	p := &PermissionByRouteProbe{
 		Method: "HEAD",
 		// Tighten the timeout so a test stub backend hang fails fast.
 		Timeout: caddy.Duration(2 * time.Second),
@@ -284,7 +284,7 @@ func TestE2E_DNSChallengeBypassesProbe(t *testing.T) {
 				"module": "acme",
 				"challenges": {
 					"dns": {
-						"provider": {"name": "permissionproxy_mock"}
+						"provider": {"name": "routeprobe_mock"}
 					}
 				}
 			}`,
@@ -295,7 +295,7 @@ func TestE2E_DNSChallengeBypassesProbe(t *testing.T) {
 			issuer: `{
 				"module": "zerossl",
 				"cname_validation": {
-					"provider": {"name": "permissionproxy_mock"}
+					"provider": {"name": "routeprobe_mock"}
 				}
 			}`,
 			shouldBypass: true,
@@ -342,7 +342,7 @@ func TestE2E_DNSChallengeBypassesProbe(t *testing.T) {
 			// canary that fails the test if it ever fires — that's how
 			// we prove the DNS short-circuit triggered.
 			var dispatchCalled bool
-			p := &PermissionByReverseProxy{
+			p := &PermissionByRouteProbe{
 				logger: zap.NewNop(),
 				dispatchFn: func(context.Context, string, string) (int, bool, error) {
 					dispatchCalled = true
@@ -377,41 +377,41 @@ func TestE2E_DNSChallengeBypassesProbe(t *testing.T) {
 	}
 }
 
-// permissionproxyMockDNS is a no-op DNS provider used only by this
+// routeprobeMockDNS is a no-op DNS provider used only by this
 // package's e2e tests so configurations with `Challenges.DNS` or
 // `CNAMEValidation` actually load. It implements the libdns interfaces
 // that certmagic looks for, but every method is a no-op — the e2e
 // tests never actually solve a DNS challenge; they only need the
 // config tree to be valid so dnsChallengeCoversName can read it.
-type permissionproxyMockDNS struct{}
+type routeprobeMockDNS struct{}
 
-func (permissionproxyMockDNS) CaddyModule() caddy.ModuleInfo {
+func (routeprobeMockDNS) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "dns.providers.permissionproxy_mock",
-		New: func() caddy.Module { return new(permissionproxyMockDNS) },
+		ID:  "dns.providers.routeprobe_mock",
+		New: func() caddy.Module { return new(routeprobeMockDNS) },
 	}
 }
-func (permissionproxyMockDNS) Provision(caddy.Context) error { return nil }
+func (routeprobeMockDNS) Provision(caddy.Context) error { return nil }
 
 // libdns interfaces (AppendRecords, DeleteRecords, GetRecords,
 // SetRecords) are referenced by name when certmagic checks the
 // provider type-asserts. Returning empty results matches the existing
 // caddytest/integration MockDNSProvider.
-func (permissionproxyMockDNS) AppendRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
+func (routeprobeMockDNS) AppendRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
 	return nil, nil
 }
-func (permissionproxyMockDNS) DeleteRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
+func (routeprobeMockDNS) DeleteRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
 	return nil, nil
 }
-func (permissionproxyMockDNS) GetRecords(context.Context, string) ([]libdns.Record, error) {
+func (routeprobeMockDNS) GetRecords(context.Context, string) ([]libdns.Record, error) {
 	return nil, nil
 }
-func (permissionproxyMockDNS) SetRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
+func (routeprobeMockDNS) SetRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
 	return nil, nil
 }
 
 func init() {
-	caddy.RegisterModule(permissionproxyMockDNS{})
+	caddy.RegisterModule(routeprobeMockDNS{})
 }
 
 // TestE2E_NoOnDemand_NoModuleLoaded verifies that a config with no
@@ -626,7 +626,7 @@ func TestE2E_CachedCert_BypassesProbeOnSecondHandshake(t *testing.T) {
 					}],
 					"on_demand": {
 						"permission": {
-							"module": "reverse_proxy",
+							"module": "route_probe",
 							"random_host_probe": false
 						}
 					}
