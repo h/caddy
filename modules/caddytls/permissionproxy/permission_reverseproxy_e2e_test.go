@@ -16,12 +16,23 @@ package permissionproxy
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,10 +44,10 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
 
 	// Side-effect imports register the modules the e2e tests load via
-	// JSON config (reverse_proxy handler, the standard set of TLS
-	// issuers, etc.). Without these, caddy.Load fails with
-	// "unknown module: http.handlers.reverse_proxy".
+	// JSON config (reverse_proxy handler, file_system storage, etc.).
+	// Without these, caddy.Load fails with "unknown module: ...".
 	_ "github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
+	_ "github.com/caddyserver/caddy/v2/modules/filestorage"
 )
 
 // TestE2E_DispatchProbesRealHandlerChain stands up a real Caddy http
@@ -79,6 +90,9 @@ func TestE2E_DispatchProbesRealHandlerChain(t *testing.T) {
 	// 3. Build a JSON config: an http server on :srvPort with a
 	//    wildcard host route → reverse_proxy to the stub.
 	//
+	//    https_port is set to srvPort so that pickServers (which
+	//    filters by configured HTTPS port) selects this server.
+	//
 	//    No tls app is configured: the test calls CertificateAllowed
 	//    directly on a manually-constructed permission module, so we
 	//    don't need on-demand wiring. The point of the test is to
@@ -111,11 +125,10 @@ func TestE2E_DispatchProbesRealHandlerChain(t *testing.T) {
 	t.Cleanup(func() { _ = caddy.Stop() })
 
 	// 4. Construct the permission module against the running context.
-	//    Use the explicit `Server` field so pickServer's lookup is by
-	//    name (decoupled from the random port).
+	//    pickServers will find srv0 by HTTPS port match (the http app
+	//    has https_port = srvPort, and srv0 listens on srvPort).
 	p := &PermissionByReverseProxy{
 		Method: "HEAD",
-		Server: "srv0",
 		// Tighten the timeout so a test stub backend hang fails fast.
 		Timeout: caddy.Duration(2 * time.Second),
 		logger:  zap.NewNop(),
@@ -124,13 +137,13 @@ func TestE2E_DispatchProbesRealHandlerChain(t *testing.T) {
 		t.Fatalf("provisioning permission module: %v", err)
 	}
 
-	// 5. Disable spoof check for this scenario: the stub upstream
-	//    *intentionally* returns 200 only for one specific Host, so
-	//    spoof check would also see a 404 for any randomized name and
-	//    correctly grant. But we want to also have a separate test for
-	//    the spoof-check-positive case below.
+	// 5. Disable host-specificity check for this scenario: the stub
+	//    upstream *intentionally* returns 200 only for one specific
+	//    Host, so the random-host probe would correctly see a 404 and
+	//    not deny — but we already have separate tests for the
+	//    host-specific check matrix.
 	fl := false
-	p.SpoofCheck = &fl
+	p.VerifyHostSpecific = &fl
 
 	t.Run("known host — allowed", func(t *testing.T) {
 		if err := p.CertificateAllowed(context.Background(), knownHost); err != nil {
@@ -156,13 +169,13 @@ func TestE2E_DispatchProbesRealHandlerChain(t *testing.T) {
 	})
 }
 
-// TestE2E_PickServerOnRealCaddyfileLayout proves that the
-// listen-port-based pickServer filter works against the *actual*
+// TestE2E_PickServersOnRealCaddyfileLayout proves that the
+// listen-port-based pickServers filter works against the *actual*
 // http app structure that Caddy's adapter + auto-HTTPS produce — not
 // just hand-built fixtures. If a future Caddy refactor renames the
 // redirect server, changes its listen port, or restructures the
 // HTTPS server's listeners, this test will catch it.
-func TestE2E_PickServerOnRealCaddyfileLayout(t *testing.T) {
+func TestE2E_PickServersOnRealCaddyfileLayout(t *testing.T) {
 	httpsPort := freePort(t)
 	httpPort := freePort(t)
 
@@ -216,8 +229,8 @@ func TestE2E_PickServerOnRealCaddyfileLayout(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = caddy.Stop() })
 
-	// Reach into the running http app and assert pickServer chooses
-	// the HTTPS server, not the auto-generated redirect server.
+	// Reach into the running http app and assert pickServers returns
+	// only the HTTPS server, not the auto-generated redirect server.
 	httpAppIface, err := caddy.ActiveContext().AppIfConfigured("http")
 	if err != nil {
 		t.Fatalf("http app not loaded: %v", err)
@@ -234,14 +247,15 @@ func TestE2E_PickServerOnRealCaddyfileLayout(t *testing.T) {
 		t.Fatal("srv0 not present in the loaded http app")
 	}
 
-	// Run the picker; it must always select srv0 (the HTTPS server).
+	// Run the picker; it must always return exactly srv0 (the HTTPS
+	// server) and exclude the redirect server.
 	for i := 0; i < 20; i++ {
-		got, err := pickServer(httpApp, "")
+		got, err := pickServers(httpApp)
 		if err != nil {
-			t.Fatalf("pickServer error on real config: %v", err)
+			t.Fatalf("pickServers error on real config: %v", err)
 		}
-		if got != srv0 {
-			t.Fatalf("pickServer chose the wrong server on real config; expected srv0 (the HTTPS server)")
+		if len(got) != 1 || got[0] != srv0 {
+			t.Fatalf("pickServers returned wrong candidates on real config; expected [srv0], got %d candidates", len(got))
 		}
 	}
 }
@@ -330,7 +344,7 @@ func TestE2E_DNSChallengeBypassesProbe(t *testing.T) {
 			var dispatchCalled bool
 			p := &PermissionByReverseProxy{
 				logger: zap.NewNop(),
-				dispatchFn: func(context.Context, string, string, string) (int, bool, error) {
+				dispatchFn: func(context.Context, string, string) (int, bool, error) {
 					dispatchCalled = true
 					// Returning denial as a defense-in-depth: if the short-
 					// circuit fails to fire, the test fails on the err
@@ -398,6 +412,313 @@ func (permissionproxyMockDNS) SetRecords(context.Context, string, []libdns.Recor
 
 func init() {
 	caddy.RegisterModule(permissionproxyMockDNS{})
+}
+
+// TestE2E_NoOnDemand_NoModuleLoaded verifies that a config with no
+// on-demand TLS anywhere doesn't auto-instantiate the new permission
+// module — i.e., the new behavior only ever runs when the operator
+// has explicitly opted into on-demand. This is a check on
+// applyOnDemandPermissionDefault's narrowed scope: explicit-subject
+// or no-on-demand configs must remain probe-free.
+func TestE2E_NoOnDemand_NoModuleLoaded(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("upstream got an unexpected request — probe should not have run: %v %v", r.Method, r.Host)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(upstream.Close)
+
+	// A regular (non-on-demand) site. The TLS app provisions normally
+	// but `Automation.OnDemand` should remain unset.
+	cfgJSON := fmt.Sprintf(`{
+		"admin": {"disabled": true},
+		"apps": {
+			"http": {
+				"servers": {
+					"srv0": {
+						"listen": ["127.0.0.1:%d"],
+						"automatic_https": {"disable": true},
+						"routes": [{
+							"match": [{"host": ["example.com"]}],
+							"handle": [{
+								"handler": "reverse_proxy",
+								"upstreams": [{"dial": "%s"}]
+							}]
+						}]
+					}
+				}
+			},
+			"tls": {
+				"automation": {
+					"policies": [{
+						"subjects": ["example.com"],
+						"issuers": [{"module": "internal"}]
+					}]
+				}
+			}
+		}
+	}`, freePort(t), strings.TrimPrefix(upstream.URL, "http://"))
+
+	if err := caddy.Load([]byte(cfgJSON), true); err != nil {
+		t.Fatalf("loading caddy config: %v", err)
+	}
+	t.Cleanup(func() { _ = caddy.Stop() })
+
+	tlsAppIface, err := caddy.ActiveContext().AppIfConfigured("tls")
+	if err != nil {
+		t.Fatalf("tls app not loaded: %v", err)
+	}
+	tls := tlsAppIface.(*caddytls.TLS)
+	if tls.Automation == nil || tls.Automation.OnDemand != nil {
+		t.Errorf("expected Automation.OnDemand to be nil when no policy enables on-demand; got %+v", tls.Automation.OnDemand)
+	}
+}
+
+// TestE2E_StaticCert_BypassesProbe verifies that when a certificate
+// is already loaded for a hostname (via tls.certificates.load_files),
+// a TLS handshake to that hostname uses the loaded cert directly and
+// never triggers the on-demand probe — even though on-demand is
+// enabled for the wildcard zone.
+//
+// The oracle is the upstream stub: if the probe runs, the upstream
+// receives a HEAD request. The test asserts the upstream's request
+// counter is exactly 0.
+//
+// Uses a hostname unique to this test so a previous test's
+// (legitimately-cached) cert in the package-global cert cache can't
+// accidentally satisfy this handshake from cache.
+func TestE2E_StaticCert_BypassesProbe(t *testing.T) {
+	const knownHost = "staticcert-test-host.example.com"
+
+	// Generate a self-signed cert for knownHost and write it to PEM
+	// files.
+	certFile, keyFile := writeSelfSignedCertPEM(t, knownHost)
+
+	var probeCount atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		probeCount.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	httpsPort := freePort(t)
+	cfgJSON := fmt.Sprintf(`{
+		"admin": {"disabled": true},
+		"apps": {
+			"http": {
+				"https_port": %d,
+				"servers": {
+					"srv0": {
+						"listen": ["127.0.0.1:%d"],
+						"routes": [{
+							"match": [{"host": ["*.example.com"]}],
+							"handle": [{
+								"handler": "reverse_proxy",
+								"upstreams": [{"dial": "%s"}]
+							}],
+							"terminal": true
+						}],
+						"tls_connection_policies": [{}]
+					}
+				}
+			},
+			"tls": {
+				"certificates": {
+					"load_files": [{
+						"certificate": "%s",
+						"key": "%s",
+						"tags": ["static"]
+					}]
+				},
+				"automation": {
+					"policies": [{
+						"subjects": ["*.example.com"],
+						"issuers": [{"module": "internal"}],
+						"on_demand": true
+					}]
+				}
+			}
+		}
+	}`, httpsPort, httpsPort, strings.TrimPrefix(upstream.URL, "http://"),
+		filepath.ToSlash(certFile), filepath.ToSlash(keyFile))
+
+	if err := caddy.Load([]byte(cfgJSON), true); err != nil {
+		t.Fatalf("loading caddy config: %v", err)
+	}
+	t.Cleanup(func() { _ = caddy.Stop() })
+
+	// Drive a real TLS handshake to knownHost. With the cert preloaded,
+	// the handshake must use it without ever triggering on-demand.
+	if err := tlsHandshake(httpsPort, knownHost); err != nil {
+		t.Fatalf("TLS handshake to %s failed: %v", knownHost, err)
+	}
+
+	// Allow a brief moment for any straggling async probe to fire
+	// (there shouldn't be any, but let's be honest about timing).
+	time.Sleep(100 * time.Millisecond)
+
+	if got := probeCount.Load(); got != 0 {
+		t.Errorf("expected 0 probe requests with a static cert preloaded; got %d", got)
+	}
+}
+
+// TestE2E_CachedCert_BypassesProbeOnSecondHandshake verifies that
+// once a certificate has been issued and cached (e.g. on the first
+// on-demand handshake), subsequent handshakes for the same hostname
+// reuse the cache and don't re-trigger the probe.
+//
+// The oracle is again the upstream stub; with VerifyHostSpecific
+// disabled (so we get exactly one probe request per cert miss), the
+// test asserts the upstream sees exactly 1 request after two
+// handshakes — proof that the second hit the cache.
+//
+// Uses a hostname unique to this test so a previous test's
+// (legitimately-cached) cert in the package-global cert cache can't
+// pre-satisfy the first handshake.
+func TestE2E_CachedCert_BypassesProbeOnSecondHandshake(t *testing.T) {
+	const knownHost = "cachedcert-test-host.example.com"
+
+	var probeCount atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The probe interrogates with HEAD; only count probe-shaped requests.
+		if r.Host == knownHost {
+			probeCount.Add(1)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+
+	httpsPort := freePort(t)
+	httpPort := freePort(t)
+	// Fresh storage per test so previously-issued certs from earlier
+	// runs don't satisfy the first handshake from cache.
+	storageRoot := filepath.ToSlash(t.TempDir())
+	cfgJSON := fmt.Sprintf(`{
+		"admin": {"disabled": true},
+		"storage": {
+			"module": "file_system",
+			"root": "%s"
+		},
+		"apps": {
+			"http": {
+				"http_port": %d,
+				"https_port": %d,
+				"servers": {
+					"srv0": {
+						"listen": ["127.0.0.1:%d"],
+						"routes": [{
+							"match": [{"host": ["*.example.com"]}],
+							"handle": [{
+								"handler": "reverse_proxy",
+								"upstreams": [{"dial": "%s"}]
+							}],
+							"terminal": true
+						}],
+						"tls_connection_policies": [{}]
+					}
+				}
+			},
+			"tls": {
+				"automation": {
+					"policies": [{
+						"subjects": ["*.example.com"],
+						"issuers": [{"module": "internal"}],
+						"on_demand": true
+					}],
+					"on_demand": {
+						"permission": {
+							"module": "reverse_proxy",
+							"verify_host_specific": false
+						}
+					}
+				}
+			}
+		}
+	}`, storageRoot, httpPort, httpsPort, httpsPort, strings.TrimPrefix(upstream.URL, "http://"))
+
+	if err := caddy.Load([]byte(cfgJSON), true); err != nil {
+		t.Fatalf("loading caddy config: %v", err)
+	}
+	t.Cleanup(func() { _ = caddy.Stop() })
+
+	// First handshake: cache miss → probe runs → cert issued (internal CA).
+	if err := tlsHandshake(httpsPort, knownHost); err != nil {
+		t.Fatalf("first TLS handshake to %s failed: %v", knownHost, err)
+	}
+	first := probeCount.Load()
+	if first == 0 {
+		t.Fatalf("expected the first handshake to trigger at least one probe; got 0")
+	}
+
+	// Second handshake: cache hit → no probe expected.
+	if err := tlsHandshake(httpsPort, knownHost); err != nil {
+		t.Fatalf("second TLS handshake to %s failed: %v", knownHost, err)
+	}
+
+	// Allow a beat for any deferred async work.
+	time.Sleep(100 * time.Millisecond)
+
+	second := probeCount.Load()
+	if second != first {
+		t.Errorf("second handshake unexpectedly probed: probeCount went from %d to %d", first, second)
+	}
+}
+
+// writeSelfSignedCertPEM generates an ECDSA self-signed certificate
+// for the given hostname, writes the cert and key to temp PEM files,
+// and returns their paths. Files are cleaned up when the test ends.
+func writeSelfSignedCertPEM(t *testing.T, hostname string) (certPath, keyPath string) {
+	t.Helper()
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: hostname},
+		DNSNames:     []string{hostname},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	derBytes, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("creating cert: %v", err)
+	}
+	keyBytes, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshalling key: %v", err)
+	}
+
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes}), 0o600); err != nil {
+		t.Fatalf("writing cert: %v", err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}), 0o600); err != nil {
+		t.Fatalf("writing key: %v", err)
+	}
+	return certPath, keyPath
+}
+
+// tlsHandshake dials 127.0.0.1:port, performs a TLS handshake with
+// SNI=hostname, and immediately closes. Returns any handshake error
+// (the connection itself is throwaway — the on-demand probe path is
+// what we care about, and that fires inside the GetCertificate
+// callback during the handshake). Self-signed/internal certs are
+// accepted via InsecureSkipVerify.
+func tlsHandshake(port int, hostname string) error {
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", fmt.Sprintf("127.0.0.1:%d", port), &tls.Config{
+		ServerName:         hostname,
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		return err
+	}
+	return conn.Close()
 }
 
 // freePort asks the OS for a free TCP port and returns it.

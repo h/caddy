@@ -21,7 +21,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,9 +42,8 @@ type stubDispatch struct {
 }
 
 type dispatchCall struct {
-	method     string
-	hostname   string
-	serverName string
+	method   string
+	hostname string
 }
 
 type dispatchResp struct {
@@ -54,9 +52,9 @@ type dispatchResp struct {
 	err     error
 }
 
-func (s *stubDispatch) fn() func(ctx context.Context, method, hostname, serverName string) (int, bool, error) {
-	return func(ctx context.Context, method, hostname, serverName string) (int, bool, error) {
-		call := dispatchCall{method: method, hostname: hostname, serverName: serverName}
+func (s *stubDispatch) fn() func(ctx context.Context, method, hostname string) (int, bool, error) {
+	return func(ctx context.Context, method, hostname string) (int, bool, error) {
+		call := dispatchCall{method: method, hostname: hostname}
 		s.mu.Lock()
 		s.calls = append(s.calls, call)
 		s.mu.Unlock()
@@ -72,18 +70,18 @@ func (s *stubDispatch) callCount() int {
 }
 
 // newPerm produces a PermissionByReverseProxy with sensible defaults
-// for testing: HEAD method, 1s timeout, spoof check on, no DNS coverage,
-// and a logger that drops everything.
+// for testing: HEAD method, 1s timeout, host-specificity check on, no
+// DNS coverage, and a logger that drops everything.
 func newPerm(t *testing.T, dispatch *stubDispatch) *PermissionByReverseProxy {
 	t.Helper()
 	tr := true
 	return &PermissionByReverseProxy{
-		Method:      "HEAD",
-		Timeout:     caddy.Duration(time.Second),
-		SpoofCheck:  &tr,
-		logger:      zap.NewNop(),
-		dispatchFn:  dispatch.fn(),
-		dnsCoversFn: func(string) bool { return false },
+		Method:             "HEAD",
+		Timeout:            caddy.Duration(time.Second),
+		VerifyHostSpecific: &tr,
+		logger:             zap.NewNop(),
+		dispatchFn:         dispatch.fn(),
+		dnsCoversFn:        func(string) bool { return false },
 	}
 }
 
@@ -208,18 +206,19 @@ func TestCertificateAllowed_DeniesWhenSpoofProbeAlsoSucceeds(t *testing.T) {
 	}
 }
 
-func TestCertificateAllowed_AllowsWhenSpoofCheckDisabled(t *testing.T) {
-	// Even if backend would return 200 for a spoofed host, with spoof check off we allow.
+func TestCertificateAllowed_AllowsWhenVerifyHostSpecificDisabled(t *testing.T) {
+	// Even if backend would return 200 for any host, with the
+	// host-specificity check disabled we allow.
 	stub := &stubDispatch{respond: always(200, true, nil)}
 	fl := false
 	p := newPerm(t, stub)
-	p.SpoofCheck = &fl
+	p.VerifyHostSpecific = &fl
 
 	if err := p.CertificateAllowed(context.Background(), "foo.example.com"); err != nil {
-		t.Fatalf("expected allow with spoof_check=false, got: %v", err)
+		t.Fatalf("expected allow with verify_host_specific=false, got: %v", err)
 	}
 	if got := stub.callCount(); got != 1 {
-		t.Errorf("expected 1 dispatch call when spoof check is disabled, got %d", got)
+		t.Errorf("expected 1 dispatch call when host-specificity check is disabled, got %d", got)
 	}
 }
 
@@ -311,33 +310,7 @@ func TestCertificateAllowed_AppliesTimeout(t *testing.T) {
 }
 
 // ============================================================
-// CertificateAllowed: server selection
-// ============================================================
-
-func TestCertificateAllowed_PassesExplicitServerName(t *testing.T) {
-	var seen atomic.Pointer[string]
-	stub := &stubDispatch{
-		respond: func(c dispatchCall) dispatchResp {
-			s := c.serverName
-			seen.Store(&s)
-			return dispatchResp{status: 200, matched: true}
-		},
-	}
-	p := newPerm(t, stub)
-	p.Server = "srv0"
-	fl := false
-	p.SpoofCheck = &fl // simplify: avoid extra calls
-
-	if err := p.CertificateAllowed(context.Background(), "foo.example.com"); err != nil {
-		t.Fatalf("expected allow, got: %v", err)
-	}
-	if got := seen.Load(); got == nil || *got != "srv0" {
-		t.Errorf("expected serverName=srv0 to be passed to dispatch, got %v", got)
-	}
-}
-
-// ============================================================
-// Method, timeout, and spoof_check defaults
+// Method, timeout, and verify_host_specific defaults
 // ============================================================
 
 func TestMethodDefault(t *testing.T) {
@@ -368,26 +341,26 @@ func TestTimeoutOverride(t *testing.T) {
 	}
 }
 
-func TestSpoofCheckEnabled_NilDefaultsTrue(t *testing.T) {
+func TestVerifyHostSpecificEnabled_NilDefaultsTrue(t *testing.T) {
 	p := &PermissionByReverseProxy{}
-	if !p.spoofCheckEnabled() {
-		t.Error("expected spoof check to default to enabled when SpoofCheck is nil")
+	if !p.verifyHostSpecificEnabled() {
+		t.Error("expected host-specificity check to default to enabled when VerifyHostSpecific is nil")
 	}
 }
 
-func TestSpoofCheckEnabled_ExplicitTrue(t *testing.T) {
+func TestVerifyHostSpecificEnabled_ExplicitTrue(t *testing.T) {
 	tr := true
-	p := &PermissionByReverseProxy{SpoofCheck: &tr}
-	if !p.spoofCheckEnabled() {
-		t.Error("expected spoof check to be enabled when SpoofCheck=true")
+	p := &PermissionByReverseProxy{VerifyHostSpecific: &tr}
+	if !p.verifyHostSpecificEnabled() {
+		t.Error("expected host-specificity check to be enabled when VerifyHostSpecific=true")
 	}
 }
 
-func TestSpoofCheckEnabled_ExplicitFalse(t *testing.T) {
+func TestVerifyHostSpecificEnabled_ExplicitFalse(t *testing.T) {
 	fl := false
-	p := &PermissionByReverseProxy{SpoofCheck: &fl}
-	if p.spoofCheckEnabled() {
-		t.Error("expected spoof check to be disabled when SpoofCheck=false")
+	p := &PermissionByReverseProxy{VerifyHostSpecific: &fl}
+	if p.verifyHostSpecificEnabled() {
+		t.Error("expected host-specificity check to be disabled when VerifyHostSpecific=false")
 	}
 }
 
@@ -460,8 +433,8 @@ func TestUnmarshalCaddyfile_EmptyBlock(t *testing.T) {
 	if p.method() != "HEAD" {
 		t.Errorf("default method after empty parse: got %q want HEAD", p.method())
 	}
-	if !p.spoofCheckEnabled() {
-		t.Error("spoof_check should default to true after empty parse")
+	if !p.verifyHostSpecificEnabled() {
+		t.Error("verify_host_specific should default to true after empty parse")
 	}
 }
 
@@ -469,8 +442,7 @@ func TestUnmarshalCaddyfile_FullBlock(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`reverse_proxy {
         method GET
         timeout 5s
-        spoof_check false
-        server srv0
+        verify_host_specific false
     }`)
 	p := &PermissionByReverseProxy{}
 	if err := p.UnmarshalCaddyfile(d); err != nil {
@@ -482,11 +454,8 @@ func TestUnmarshalCaddyfile_FullBlock(t *testing.T) {
 	if time.Duration(p.Timeout) != 5*time.Second {
 		t.Errorf("Timeout: got %v, want 5s", time.Duration(p.Timeout))
 	}
-	if p.SpoofCheck == nil || *p.SpoofCheck {
-		t.Errorf("SpoofCheck: got %v, want explicit false", p.SpoofCheck)
-	}
-	if p.Server != "srv0" {
-		t.Errorf("Server: got %q, want srv0", p.Server)
+	if p.VerifyHostSpecific == nil || *p.VerifyHostSpecific {
+		t.Errorf("VerifyHostSpecific: got %v, want explicit false", p.VerifyHostSpecific)
 	}
 }
 
@@ -516,19 +485,18 @@ func TestImplementsOnDemandPermission(t *testing.T) {
 }
 
 // ============================================================
-// pickServer
+// pickServers
 // ============================================================
 
 // httpsServer returns a minimal *caddyhttp.Server that listens on
-// `:443` (the default HTTPS port) — i.e., one that pickServer should
-// treat as the HTTPS server.
+// `:443` (the default HTTPS port).
 func httpsServer() *caddyhttp.Server {
 	return &caddyhttp.Server{Listen: []string{":443"}}
 }
 
 // httpRedirectServer returns a minimal *caddyhttp.Server that listens
 // on `:80` only — i.e., a `remaining_auto_https_redirects`-style
-// server that pickServer should filter out.
+// server that pickServers should filter out.
 func httpRedirectServer() *caddyhttp.Server {
 	return &caddyhttp.Server{Listen: []string{":80"}}
 }
@@ -537,30 +505,28 @@ func httpsAppWith(servers map[string]*caddyhttp.Server) *caddyhttp.App {
 	return &caddyhttp.App{Servers: servers}
 }
 
-func TestPickServer_PrefersHTTPSServerOverRedirectServer(t *testing.T) {
-	// The canonical auto-HTTPS scenario. The user-defined HTTPS server
+func TestPickServers_FiltersOutRedirectServer(t *testing.T) {
+	// Canonical auto-HTTPS scenario. The user-defined HTTPS server
 	// (`srv0`) listens on :443 and the auto-generated redirect server
-	// (`remaining_auto_https_redirects`) listens on :80. The probe must
-	// always go to the HTTPS one regardless of map iteration order.
+	// (`remaining_auto_https_redirects`) listens on :80. The redirect
+	// server must never appear in the candidate list.
 	tlsSrv := httpsServer()
 	app := httpsAppWith(map[string]*caddyhttp.Server{
 		"srv0":                           tlsSrv,
 		"remaining_auto_https_redirects": httpRedirectServer(),
 	})
-	// Run several times to defeat any chance the test could pass by
-	// luck of iteration order.
 	for i := 0; i < 20; i++ {
-		got, err := pickServer(app, "")
+		got, err := pickServers(app)
 		if err != nil {
-			t.Fatalf("pickServer error: %v", err)
+			t.Fatalf("pickServers error: %v", err)
 		}
-		if got != tlsSrv {
-			t.Fatalf("expected pickServer to choose the HTTPS server every time; got the redirect server")
+		if len(got) != 1 || got[0] != tlsSrv {
+			t.Fatalf("expected exactly the HTTPS server; got %d candidates", len(got))
 		}
 	}
 }
 
-func TestPickServer_HonorsCustomHTTPSPort(t *testing.T) {
+func TestPickServers_HonorsCustomHTTPSPort(t *testing.T) {
 	// User overrides https_port to 9443. The HTTPS server should be
 	// selected based on the configured port, not the default 443.
 	tlsSrv := &caddyhttp.Server{Listen: []string{":9443"}}
@@ -571,74 +537,63 @@ func TestPickServer_HonorsCustomHTTPSPort(t *testing.T) {
 			"remaining_auto_https_redirects": &caddyhttp.Server{Listen: []string{":9080"}},
 		},
 	}
-	got, err := pickServer(app, "")
+	got, err := pickServers(app)
 	if err != nil {
-		t.Fatalf("pickServer error: %v", err)
+		t.Fatalf("pickServers error: %v", err)
 	}
-	if got != tlsSrv {
+	if len(got) != 1 || got[0] != tlsSrv {
 		t.Error("expected the server listening on the custom https_port")
 	}
 }
 
-func TestPickServer_HonorsPortRangeListen(t *testing.T) {
+func TestPickServers_HonorsPortRangeListen(t *testing.T) {
 	tlsSrv := &caddyhttp.Server{Listen: []string{":8000-9000"}}
 	app := &caddyhttp.App{
 		HTTPSPort: 8443,
 		Servers:   map[string]*caddyhttp.Server{"srv0": tlsSrv},
 	}
-	got, err := pickServer(app, "")
+	got, err := pickServers(app)
 	if err != nil {
-		t.Fatalf("pickServer error: %v", err)
+		t.Fatalf("pickServers error: %v", err)
 	}
-	if got != tlsSrv {
+	if len(got) != 1 || got[0] != tlsSrv {
 		t.Error("expected port-range listen to be matched")
 	}
 }
 
-func TestPickServer_ErrorsWhenNoServerListensOnHTTPS(t *testing.T) {
+func TestPickServers_ErrorsWhenNoServerListensOnHTTPS(t *testing.T) {
 	app := httpsAppWith(map[string]*caddyhttp.Server{
 		"remaining_auto_https_redirects": httpRedirectServer(),
 	})
-	if _, err := pickServer(app, ""); err == nil {
+	if _, err := pickServers(app); err == nil {
 		t.Error("expected error when no server listens on https port; got nil")
 	}
 }
 
-func TestPickServer_ErrorsWhenMultipleHTTPSServers(t *testing.T) {
+func TestPickServers_ReturnsAllHTTPSServersInNameOrder(t *testing.T) {
+	// Multiple servers that listen on the HTTPS port: pickServers must
+	// return all of them, deterministically sorted by name. The
+	// dispatcher will then try each in order until one handles the
+	// hostname.
+	a := &caddyhttp.Server{Listen: []string{":443"}}
+	b := &caddyhttp.Server{Listen: []string{":443"}}
+	c := &caddyhttp.Server{Listen: []string{":443"}}
 	app := httpsAppWith(map[string]*caddyhttp.Server{
-		"srv0": httpsServer(),
-		"srv1": httpsServer(),
+		"srv2": c,
+		"srv0": a,
+		"srv1": b,
 	})
-	_, err := pickServer(app, "")
-	if err == nil {
-		t.Fatal("expected error with multiple https servers")
-	}
-	if !strings.Contains(err.Error(), "set `server`") {
-		t.Errorf("error should suggest setting the `server` field; got: %v", err)
-	}
-}
-
-func TestPickServer_ExplicitName_Selected(t *testing.T) {
-	// Explicit `server` overrides the port-based filter — even a server
-	// that doesn't listen on the HTTPS port can be chosen this way.
-	tlsSrv := httpRedirectServer() // intentionally not on :443
-	app := httpsAppWith(map[string]*caddyhttp.Server{
-		"srv0":                           httpsServer(),
-		"remaining_auto_https_redirects": tlsSrv,
-	})
-	got, err := pickServer(app, "remaining_auto_https_redirects")
-	if err != nil {
-		t.Fatalf("pickServer error: %v", err)
-	}
-	if got != tlsSrv {
-		t.Error("expected explicit name to return the named server regardless of port")
-	}
-}
-
-func TestPickServer_ExplicitName_Missing(t *testing.T) {
-	app := httpsAppWith(map[string]*caddyhttp.Server{"srv0": httpsServer()})
-	if _, err := pickServer(app, "nope"); err == nil {
-		t.Error("expected error when explicit server name doesn't exist")
+	for i := 0; i < 20; i++ {
+		got, err := pickServers(app)
+		if err != nil {
+			t.Fatalf("pickServers error: %v", err)
+		}
+		if len(got) != 3 {
+			t.Fatalf("expected 3 candidates; got %d", len(got))
+		}
+		if got[0] != a || got[1] != b || got[2] != c {
+			t.Errorf("expected name-sorted order [srv0, srv1, srv2]; got different order on iteration %d", i)
+		}
 	}
 }
 

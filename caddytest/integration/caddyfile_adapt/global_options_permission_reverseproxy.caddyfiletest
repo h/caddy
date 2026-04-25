@@ -3,8 +3,7 @@
 		permission reverse_proxy {
 			method GET
 			timeout 5s
-			spoof_check false
-			server srv0
+			verify_host_specific false
 		}
 	}
 }
@@ -72,9 +71,8 @@
 					"permission": {
 						"method": "GET",
 						"module": "reverse_proxy",
-						"server": "srv0",
-						"spoof_check": false,
-						"timeout": 5000000000
+						"timeout": 5000000000,
+						"verify_host_specific": false
 					}
 				}
 			}

@@ -20,11 +20,12 @@
 // upstream returns 2xx, the certificate is allowed. Anything else
 // (non-2xx, no matching route, network error) denies it.
 //
-// To defend against backends that ignore the Host header (which would
-// otherwise let an attacker mint unbounded certs against a wildcard
-// zone), the module also performs a "spoof check": a second probe with
-// a randomized first label. If that also returns 2xx, the cert is
-// denied because the backend is not validating the hostname.
+// To defend against upstreams that don't validate the Host header
+// (which would otherwise let an attacker mint unbounded certs against
+// a wildcard zone), the module also runs a host-specificity check: a
+// second probe with a randomized first label. If that also returns
+// 2xx, the upstream is treated as host-blind and the certificate is
+// denied.
 //
 // If the matching automation policy already has an issuer with a DNS
 // challenge configured (e.g. via `acme_dns` or ZeroSSL CNAME
@@ -43,6 +44,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"time"
 
@@ -66,26 +68,29 @@ type PermissionByReverseProxy struct {
 	// HTTP method for the probe. Default: "HEAD".
 	Method string `json:"method,omitempty"`
 
-	// Probe timeout. Default: 10s. Applied independently to the
-	// real probe and the spoof probe.
+	// Probe timeout. Default: 10s. Applied independently to the real
+	// probe and the verification probe.
 	Timeout caddy.Duration `json:"timeout,omitempty"`
 
-	// Whether to perform the random-subdomain spoof check.
+	// Whether to verify that the configured upstream gives a
+	// host-specific response — that is, that it doesn't return 2xx for
+	// arbitrary hostnames. When enabled (default), the module sends a
+	// second probe with a randomized first label after the real probe;
+	// if the upstream answers 2xx for that random hostname too, the
+	// upstream is treated as host-blind and the certificate is denied.
+	//
+	// Disabling this check is unsafe on a wildcard zone: a misconfigured
+	// upstream can be tricked into causing the issuance of unbounded
+	// certificates.
+	//
 	// Default: true.
-	SpoofCheck *bool `json:"spoof_check,omitempty"`
-
-	// Optional: explicit name of the http server to dispatch the
-	// probe through. If empty, the module picks the server with
-	// non-empty TLS connection policies (i.e., the HTTPS server).
-	// Set this when you have multiple TLS servers and need to
-	// disambiguate.
-	Server string `json:"server,omitempty"`
+	VerifyHostSpecific *bool `json:"verify_host_specific,omitempty"`
 
 	ctx    caddy.Context
 	logger *zap.Logger
 
 	// Test seams. Set by Provision in production; tests overwrite directly.
-	dispatchFn  func(ctx context.Context, method, hostname, serverName string) (status int, matched bool, err error)
+	dispatchFn  func(ctx context.Context, method, hostname string) (status int, matched bool, err error)
 	dnsCoversFn func(name string) bool
 }
 
@@ -130,8 +135,7 @@ func (p *PermissionByReverseProxy) Provision(ctx caddy.Context) error {
 //	permission reverse_proxy {
 //	    method <method>
 //	    timeout <duration>
-//	    spoof_check <bool>
-//	    server <server-name>
+//	    verify_host_specific <bool>
 //	}
 //
 // All sub-directives are optional.
@@ -165,7 +169,7 @@ func (p *PermissionByReverseProxy) UnmarshalCaddyfile(d *caddyfile.Dispenser) er
 			if d.NextArg() {
 				return d.ArgErr()
 			}
-		case "spoof_check":
+		case "verify_host_specific":
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
@@ -177,17 +181,9 @@ func (p *PermissionByReverseProxy) UnmarshalCaddyfile(d *caddyfile.Dispenser) er
 			case "false", "off", "no":
 				b = false
 			default:
-				return d.Errf("spoof_check must be true/false, got %q", val)
+				return d.Errf("verify_host_specific must be true/false, got %q", val)
 			}
-			p.SpoofCheck = &b
-			if d.NextArg() {
-				return d.ArgErr()
-			}
-		case "server":
-			if !d.NextArg() {
-				return d.ArgErr()
-			}
-			p.Server = d.Val()
+			p.VerifyHostSpecific = &b
 			if d.NextArg() {
 				return d.ArgErr()
 			}
@@ -211,7 +207,8 @@ func (p *PermissionByReverseProxy) CertificateAllowed(ctx context.Context, name 
 	}
 
 	// 2. Real probe. Each probe gets its own fresh deadline so that a
-	//    slow real probe doesn't starve the spoof probe of budget.
+	//    slow real probe doesn't starve the host-specificity probe of
+	//    budget.
 	status, matched, err := p.runProbe(ctx, name)
 	if err != nil {
 		return fmt.Errorf("probing %s: %w", name, err)
@@ -223,21 +220,22 @@ func (p *PermissionByReverseProxy) CertificateAllowed(ctx context.Context, name 
 		return fmt.Errorf("%s: %w (probe got HTTP %d)", name, caddytls.ErrPermissionDenied, status)
 	}
 
-	// 3. Spoof check: probe a randomized variant. If the backend returns
-	//    2xx for that, it isn't validating the Host header — refuse.
-	if p.spoofCheckEnabled() {
-		spoofName := randomizeFirstLabel(name)
-		spoofStatus, spoofMatched, spoofErr := p.runProbe(ctx, spoofName)
-		if spoofErr != nil {
-			// Spoof errors (incl. context.DeadlineExceeded) are observable
-			// but don't cause an outright denial. Make them visible at warn
-			// level so operators can spot starvation / backend trouble.
-			if c := p.logger.Check(zapcore.WarnLevel, "spoof probe errored; treating as spoof-denied"); c != nil {
-				c.Write(zap.String("domain", name), zap.String("spoof_domain", spoofName), zap.Error(spoofErr))
+	// 3. Host-specificity check: probe a randomized variant. If the
+	//    upstream returns 2xx for an unrelated random hostname too, it
+	//    isn't really validating the Host header — refuse the cert.
+	if p.verifyHostSpecificEnabled() {
+		fakeName := randomizeFirstLabel(name)
+		fakeStatus, fakeMatched, fakeErr := p.runProbe(ctx, fakeName)
+		if fakeErr != nil {
+			// Errors here (incl. context.DeadlineExceeded) are observable
+			// but don't cause an outright denial. Surface at warn level
+			// so operators can spot starvation / upstream trouble.
+			if c := p.logger.Check(zapcore.WarnLevel, "host-specificity probe errored; treating as denied"); c != nil {
+				c.Write(zap.String("domain", name), zap.String("fake_domain", fakeName), zap.Error(fakeErr))
 			}
-		} else if spoofMatched && spoofStatus >= 200 && spoofStatus <= 299 {
-			return fmt.Errorf("%s: %w (Host-blind backend; spoof probe to %s returned HTTP %d)",
-				name, caddytls.ErrPermissionDenied, spoofName, spoofStatus)
+		} else if fakeMatched && fakeStatus >= 200 && fakeStatus <= 299 {
+			return fmt.Errorf("%s: %w (host-blind upstream; probe to random hostname %s also returned HTTP %d)",
+				name, caddytls.ErrPermissionDenied, fakeName, fakeStatus)
 		}
 	}
 
@@ -248,7 +246,7 @@ func (p *PermissionByReverseProxy) CertificateAllowed(ctx context.Context, name 
 func (p *PermissionByReverseProxy) runProbe(parent context.Context, hostname string) (int, bool, error) {
 	probeCtx, cancel := context.WithTimeout(parent, p.timeout())
 	defer cancel()
-	return p.dispatchFn(probeCtx, p.method(), hostname, p.Server)
+	return p.dispatchFn(probeCtx, p.method(), hostname)
 }
 
 func (p *PermissionByReverseProxy) method() string {
@@ -265,11 +263,11 @@ func (p *PermissionByReverseProxy) timeout() time.Duration {
 	return time.Duration(p.Timeout)
 }
 
-func (p *PermissionByReverseProxy) spoofCheckEnabled() bool {
-	if p.SpoofCheck == nil {
+func (p *PermissionByReverseProxy) verifyHostSpecificEnabled() bool {
+	if p.VerifyHostSpecific == nil {
 		return true
 	}
-	return *p.SpoofCheck
+	return *p.VerifyHostSpecific
 }
 
 // randomizeFirstLabel replaces the leftmost DNS label of name with a
@@ -324,7 +322,7 @@ func randomizeFirstLabel(name string) string {
 //     hostname was unrouted, which the caller treats as denial.
 //   - err: a real probe failure (no http app, no eligible server,
 //     handler panic). Distinct from a denial.
-func (p *PermissionByReverseProxy) dispatchViaHTTPApp(ctx context.Context, method, hostname, serverName string) (int, bool, error) {
+func (p *PermissionByReverseProxy) dispatchViaHTTPApp(ctx context.Context, method, hostname string) (int, bool, error) {
 	httpAppIface, err := p.ctx.AppIfConfigured("http")
 	if err != nil || httpAppIface == nil {
 		return 0, false, fmt.Errorf("http app not available: %v", err)
@@ -334,11 +332,13 @@ func (p *PermissionByReverseProxy) dispatchViaHTTPApp(ctx context.Context, metho
 		return 0, false, fmt.Errorf("http app has unexpected type %T", httpAppIface)
 	}
 
-	srv, err := pickServer(httpApp, serverName)
+	candidates, err := pickServers(httpApp)
 	if err != nil {
 		return 0, false, err
 	}
 
+	// Build a synthetic request once; servers are dispatched against
+	// the same request copy.
 	req := httptest.NewRequest(method, "/", nil)
 	req.Host = hostname
 	req.URL.Host = hostname
@@ -355,76 +355,74 @@ func (p *PermissionByReverseProxy) dispatchViaHTTPApp(ctx context.Context, metho
 	req.RemoteAddr = "0.0.0.0:0"
 	req = req.WithContext(ctx)
 
-	pw := newProbeWriter()
+	// Try each candidate in deterministic name-sorted order. The first
+	// that actually handles the request (probeWriter records a write)
+	// wins. With the canonical single-HTTPS-server layout this is
+	// always the only iteration.
+	for _, srv := range candidates {
+		pw := newProbeWriter()
 
-	// Recover from any panic in the handler chain so a bad downstream
-	// handler can't tear down the certmagic decision goroutine.
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				if c := p.logger.Check(zapcore.ErrorLevel, "handler panicked during probe; treating as denial"); c != nil {
-					c.Write(zap.String("domain", hostname), zap.Any("panic", r))
+		// Recover from any panic in the handler chain so a misbehaving
+		// downstream handler can't tear down the certmagic decision
+		// goroutine.
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if c := p.logger.Check(zapcore.ErrorLevel, "handler panicked during probe; continuing to next candidate"); c != nil {
+						c.Write(zap.String("domain", hostname), zap.Any("panic", r))
+					}
 				}
-			}
+			}()
+			srv.ServeHTTP(pw, req)
 		}()
-		srv.ServeHTTP(pw, req)
-	}()
 
-	if !pw.handled {
-		// No handler in the chain wrote anything. Treat as no-route-match.
-		return 0, false, nil
+		if pw.handled {
+			return pw.status, true, nil
+		}
 	}
-	return pw.status, true, nil
+
+	// No candidate's handler chain wrote anything for this hostname.
+	return 0, false, nil
 }
 
-// pickServer returns the http server through which the probe should
-// be dispatched, mirroring Caddy's physical routing: a real request
-// for an on-demand-protected hostname arrives on the HTTPS listener
-// and is routed to whichever Server bound that port. We do the same
-// here — pick the server (if any) whose Listen addresses cover
-// `app.HTTPSPort`. The auto-generated `remaining_auto_https_redirects`
-// server listens on the HTTP port and is therefore filtered out
-// naturally.
+// pickServers returns every http server that listens on the
+// configured HTTPS port, sorted by server name for determinism. This
+// mirrors Caddy's physical routing: a real client request for an
+// on-demand-protected hostname arrives on the HTTPS listener and is
+// routed to whichever Server bound that port. The auto-generated
+// `remaining_auto_https_redirects` server listens on the HTTP port
+// and is therefore filtered out naturally.
 //
-// If serverName is non-empty, that explicit server is used regardless
-// of its listening ports.
-//
-// If multiple servers listen on the HTTPS port (genuine multi-TLS-
-// server configs), an error is returned asking the operator to set
-// Server explicitly.
-func pickServer(app *caddyhttp.App, serverName string) (*caddyhttp.Server, error) {
-	if serverName != "" {
-		srv, ok := app.Servers[serverName]
-		if !ok {
-			return nil, fmt.Errorf("no http server named %q", serverName)
-		}
-		return srv, nil
-	}
-
+// In the canonical single-HTTPS-server layout this returns one
+// element. In multi-HTTPS-server configurations it returns all
+// candidates; the caller dispatches through them in order until one
+// actually handles the request.
+func pickServers(app *caddyhttp.App) ([]*caddyhttp.Server, error) {
 	httpsPort := app.HTTPSPort
 	if httpsPort == 0 {
 		httpsPort = caddyhttp.DefaultHTTPSPort
 	}
 
-	var (
-		picked  *caddyhttp.Server
-		matches []string
-	)
+	type named struct {
+		name string
+		srv  *caddyhttp.Server
+	}
+	var matches []named
 	for name, srv := range app.Servers {
-		if !serverListensOnPort(srv, httpsPort) {
-			continue
+		if serverListensOnPort(srv, httpsPort) {
+			matches = append(matches, named{name: name, srv: srv})
 		}
-		picked = srv
-		matches = append(matches, name)
 	}
-	switch len(matches) {
-	case 0:
-		return nil, fmt.Errorf("no http server listens on https port %d; set `server` to disambiguate", httpsPort)
-	case 1:
-		return picked, nil
-	default:
-		return nil, fmt.Errorf("multiple http servers listen on https port %d (%v); set `server` to disambiguate", httpsPort, matches)
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("no http server listens on https port %d", httpsPort)
 	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].name < matches[j].name })
+
+	out := make([]*caddyhttp.Server, len(matches))
+	for i, m := range matches {
+		out[i] = m.srv
+	}
+	return out, nil
 }
 
 // serverListensOnPort reports whether any of srv.Listen's addresses
