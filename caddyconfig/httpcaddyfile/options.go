@@ -425,7 +425,7 @@ func parseOptOnDemand(d *caddyfile.Dispenser, _ any) (any, error) {
 			}
 			ond.PermissionRaw = caddyconfig.JSONModuleObject(perm, "module", modName, nil)
 
-		case "route_probe":
+		case "probe":
 			// Sugar for the tls.permission.route_probe module: probes the
 			// configured upstream through Caddy's own routes to decide
 			// whether on-demand cert issuance is allowed for a hostname.
@@ -437,7 +437,7 @@ func parseOptOnDemand(d *caddyfile.Dispenser, _ any) (any, error) {
 			if ond.PermissionRaw != nil {
 				return nil, d.Err("on-demand TLS permission module (or 'ask') already specified")
 			}
-			const modName = "route_probe"
+			const modName = "probe"
 			unm, err := caddyfile.UnmarshalModule(d, "tls.permission."+modName)
 			if err != nil {
 				return nil, err

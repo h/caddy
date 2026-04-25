@@ -11,7 +11,7 @@ import (
 	_ "github.com/caddyserver/caddy/v2/modules/caddypki/acmeserver"
 	_ "github.com/caddyserver/caddy/v2/modules/caddytls"
 	_ "github.com/caddyserver/caddy/v2/modules/caddytls/distributedstek"
-	_ "github.com/caddyserver/caddy/v2/modules/caddytls/routeprobe"
+	_ "github.com/caddyserver/caddy/v2/modules/caddytls/probe"
 	_ "github.com/caddyserver/caddy/v2/modules/caddytls/standardstek"
 	_ "github.com/caddyserver/caddy/v2/modules/filestorage"
 	_ "github.com/caddyserver/caddy/v2/modules/logging"

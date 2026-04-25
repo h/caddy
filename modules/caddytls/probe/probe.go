@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package routeprobe registers an on-demand TLS permission module
-// (`tls.permission.route_probe`) that decides whether a domain may
+// Package probe registers an on-demand TLS permission module
+// (`tls.permission.probe`) that decides whether a domain may
 // have a certificate issued by dispatching a synthetic HTTP request
 // through Caddy's own handler chain — i.e., the same route +
 // reverse_proxy pipeline a real client would hit. If the configured
@@ -35,7 +35,7 @@
 // This package lives outside the caddytls package because it depends
 // on caddyhttp (which already depends on caddytls); the sub-package
 // avoids the import cycle.
-package routeprobe
+package probe
 
 import (
 	"context"
@@ -58,13 +58,13 @@ import (
 )
 
 func init() {
-	caddy.RegisterModule(PermissionByRouteProbe{})
+	caddy.RegisterModule(Permission{})
 }
 
-// PermissionByRouteProbe validates an on-demand TLS request by
+// Permission validates an on-demand TLS request by
 // dispatching a synthetic HTTP request through Caddy's own handler
 // chain. See the package doc for full details.
-type PermissionByRouteProbe struct {
+type Permission struct {
 	// HTTP method for the probe. Default: "HEAD".
 	Method string `json:"method,omitempty"`
 
@@ -84,7 +84,7 @@ type PermissionByRouteProbe struct {
 	// certificates.
 	//
 	// Default: true.
-	RandomHostProbe *bool `json:"random_host_probe,omitempty"`
+	RandomHostChallenge *bool `json:"random_host_challenge,omitempty"`
 
 	ctx    caddy.Context
 	logger *zap.Logger
@@ -100,16 +100,16 @@ const (
 )
 
 // CaddyModule returns the Caddy module information.
-func (PermissionByRouteProbe) CaddyModule() caddy.ModuleInfo {
+func (Permission) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "tls.permission.route_probe",
-		New: func() caddy.Module { return new(PermissionByRouteProbe) },
+		ID:  "tls.permission.probe",
+		New: func() caddy.Module { return new(Permission) },
 	}
 }
 
 // Provision wires up the production dispatch and DNS-challenge check,
 // and validates configuration.
-func (p *PermissionByRouteProbe) Provision(ctx caddy.Context) error {
+func (p *Permission) Provision(ctx caddy.Context) error {
 	p.ctx = ctx
 	p.logger = ctx.Logger()
 
@@ -132,17 +132,17 @@ func (p *PermissionByRouteProbe) Provision(ctx caddy.Context) error {
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler. This is the
 // generic-permission form; the canonical form is the top-level
-// `route_probe` directive in the `on_demand_tls` global options
+// `probe` directive in the `on_demand_tls` global options
 // block, which produces the same JSON.
 //
-//	permission route_probe {
+//	permission probe {
 //	    method <method>
 //	    timeout <duration>
-//	    random_host_probe <bool>
+//	    random_host_challenge <bool>
 //	}
 //
 // All sub-directives are optional.
-func (p *PermissionByRouteProbe) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+func (p *Permission) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	// Consume the module name token (first call to Next() returns true on it).
 	if !d.Next() {
 		return nil
@@ -172,7 +172,7 @@ func (p *PermissionByRouteProbe) UnmarshalCaddyfile(d *caddyfile.Dispenser) erro
 			if d.NextArg() {
 				return d.ArgErr()
 			}
-		case "random_host_probe":
+		case "random_host_challenge":
 			if !d.NextArg() {
 				return d.ArgErr()
 			}
@@ -184,9 +184,9 @@ func (p *PermissionByRouteProbe) UnmarshalCaddyfile(d *caddyfile.Dispenser) erro
 			case "false", "off", "no":
 				b = false
 			default:
-				return d.Errf("random_host_probe must be true/false, got %q", val)
+				return d.Errf("random_host_challenge must be true/false, got %q", val)
 			}
-			p.RandomHostProbe = &b
+			p.RandomHostChallenge = &b
 			if d.NextArg() {
 				return d.ArgErr()
 			}
@@ -198,7 +198,7 @@ func (p *PermissionByRouteProbe) UnmarshalCaddyfile(d *caddyfile.Dispenser) erro
 }
 
 // CertificateAllowed implements caddytls.OnDemandPermission.
-func (p *PermissionByRouteProbe) CertificateAllowed(ctx context.Context, name string) error {
+func (p *Permission) CertificateAllowed(ctx context.Context, name string) error {
 	// 1. DNS short-circuit: if the matching automation policy has an
 	//    issuer with DNS-based validation configured, skip the probe.
 	//    DNS proves domain ownership without needing a probe.
@@ -226,7 +226,7 @@ func (p *PermissionByRouteProbe) CertificateAllowed(ctx context.Context, name st
 	// 3. Host-specificity check: probe a randomized variant. If the
 	//    upstream returns 2xx for an unrelated random hostname too, it
 	//    isn't really validating the Host header — refuse the cert.
-	if p.randomHostProbeEnabled() {
+	if p.randomHostChallengeEnabled() {
 		fakeName := randomizeFirstLabel(name)
 		fakeStatus, fakeMatched, fakeErr := p.runProbe(ctx, fakeName)
 		if fakeErr != nil {
@@ -246,31 +246,31 @@ func (p *PermissionByRouteProbe) CertificateAllowed(ctx context.Context, name st
 }
 
 // runProbe runs a single probe with its own fresh timeout deadline.
-func (p *PermissionByRouteProbe) runProbe(parent context.Context, hostname string) (int, bool, error) {
+func (p *Permission) runProbe(parent context.Context, hostname string) (int, bool, error) {
 	probeCtx, cancel := context.WithTimeout(parent, p.timeout())
 	defer cancel()
 	return p.dispatchFn(probeCtx, p.method(), hostname)
 }
 
-func (p *PermissionByRouteProbe) method() string {
+func (p *Permission) method() string {
 	if p.Method == "" {
 		return defaultMethod
 	}
 	return p.Method
 }
 
-func (p *PermissionByRouteProbe) timeout() time.Duration {
+func (p *Permission) timeout() time.Duration {
 	if p.Timeout == 0 {
 		return defaultTimeout
 	}
 	return time.Duration(p.Timeout)
 }
 
-func (p *PermissionByRouteProbe) randomHostProbeEnabled() bool {
-	if p.RandomHostProbe == nil {
+func (p *Permission) randomHostChallengeEnabled() bool {
+	if p.RandomHostChallenge == nil {
 		return true
 	}
-	return *p.RandomHostProbe
+	return *p.RandomHostChallenge
 }
 
 // randomizeFirstLabel replaces the leftmost DNS label of name with a
@@ -294,7 +294,7 @@ func randomizeFirstLabel(name string) string {
 			// crypto/rand is documented to never fail on supported platforms.
 			// A deterministic fallback would let an attacker predict the
 			// randomized hostname, so panic instead.
-			panic(fmt.Sprintf("routeprobe: crypto/rand failure: %v", err))
+			panic(fmt.Sprintf("probe: crypto/rand failure: %v", err))
 		}
 		for _, b := range buf {
 			if b >= cutoff {
@@ -325,7 +325,7 @@ func randomizeFirstLabel(name string) string {
 //     hostname was unrouted, which the caller treats as denial.
 //   - err: a real probe failure (no http app, no eligible server,
 //     handler panic). Distinct from a denial.
-func (p *PermissionByRouteProbe) dispatchViaHTTPApp(ctx context.Context, method, hostname string) (int, bool, error) {
+func (p *Permission) dispatchViaHTTPApp(ctx context.Context, method, hostname string) (int, bool, error) {
 	httpAppIface, err := p.ctx.AppIfConfigured("http")
 	if err != nil || httpAppIface == nil {
 		return 0, false, fmt.Errorf("http app not available: %v", err)
@@ -482,7 +482,7 @@ func (pw *probeWriter) Write(p []byte) (int, error) {
 // an ACME issuer with a DNS challenge configured, or a ZeroSSL issuer
 // with CNAME validation configured. If so, the probe is skipped
 // because DNS already validates ownership.
-func (p *PermissionByRouteProbe) dnsChallengeCoversName(name string) bool {
+func (p *Permission) dnsChallengeCoversName(name string) bool {
 	tlsAppIface, err := p.ctx.AppIfConfigured("tls")
 	if err != nil || tlsAppIface == nil {
 		return false
@@ -512,8 +512,8 @@ func (p *PermissionByRouteProbe) dnsChallengeCoversName(name string) bool {
 
 // Interface guards
 var (
-	_ caddytls.OnDemandPermission = (*PermissionByRouteProbe)(nil)
-	_ caddy.Provisioner           = (*PermissionByRouteProbe)(nil)
-	_ caddyfile.Unmarshaler       = (*PermissionByRouteProbe)(nil)
+	_ caddytls.OnDemandPermission = (*Permission)(nil)
+	_ caddy.Provisioner           = (*Permission)(nil)
+	_ caddyfile.Unmarshaler       = (*Permission)(nil)
 	_ http.ResponseWriter         = (*probeWriter)(nil)
 )

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package routeprobe
+package probe
 
 import (
 	"context"
@@ -127,7 +127,7 @@ func TestE2E_DispatchProbesRealHandlerChain(t *testing.T) {
 	// 4. Construct the permission module against the running context.
 	//    pickServers will find srv0 by HTTPS port match (the http app
 	//    has https_port = srvPort, and srv0 listens on srvPort).
-	p := &PermissionByRouteProbe{
+	p := &Permission{
 		Method: "HEAD",
 		// Tighten the timeout so a test stub backend hang fails fast.
 		Timeout: caddy.Duration(2 * time.Second),
@@ -143,7 +143,7 @@ func TestE2E_DispatchProbesRealHandlerChain(t *testing.T) {
 	//    not deny — but we already have separate tests for the
 	//    random-host probe matrix.
 	fl := false
-	p.RandomHostProbe = &fl
+	p.RandomHostChallenge = &fl
 
 	t.Run("known host — allowed", func(t *testing.T) {
 		if err := p.CertificateAllowed(context.Background(), knownHost); err != nil {
@@ -284,7 +284,7 @@ func TestE2E_DNSChallengeBypassesProbe(t *testing.T) {
 				"module": "acme",
 				"challenges": {
 					"dns": {
-						"provider": {"name": "routeprobe_mock"}
+						"provider": {"name": "probe_mock"}
 					}
 				}
 			}`,
@@ -295,7 +295,7 @@ func TestE2E_DNSChallengeBypassesProbe(t *testing.T) {
 			issuer: `{
 				"module": "zerossl",
 				"cname_validation": {
-					"provider": {"name": "routeprobe_mock"}
+					"provider": {"name": "probe_mock"}
 				}
 			}`,
 			shouldBypass: true,
@@ -342,7 +342,7 @@ func TestE2E_DNSChallengeBypassesProbe(t *testing.T) {
 			// canary that fails the test if it ever fires — that's how
 			// we prove the DNS short-circuit triggered.
 			var dispatchCalled bool
-			p := &PermissionByRouteProbe{
+			p := &Permission{
 				logger: zap.NewNop(),
 				dispatchFn: func(context.Context, string, string) (int, bool, error) {
 					dispatchCalled = true
@@ -377,41 +377,41 @@ func TestE2E_DNSChallengeBypassesProbe(t *testing.T) {
 	}
 }
 
-// routeprobeMockDNS is a no-op DNS provider used only by this
+// probeMockDNS is a no-op DNS provider used only by this
 // package's e2e tests so configurations with `Challenges.DNS` or
 // `CNAMEValidation` actually load. It implements the libdns interfaces
 // that certmagic looks for, but every method is a no-op — the e2e
 // tests never actually solve a DNS challenge; they only need the
 // config tree to be valid so dnsChallengeCoversName can read it.
-type routeprobeMockDNS struct{}
+type probeMockDNS struct{}
 
-func (routeprobeMockDNS) CaddyModule() caddy.ModuleInfo {
+func (probeMockDNS) CaddyModule() caddy.ModuleInfo {
 	return caddy.ModuleInfo{
-		ID:  "dns.providers.routeprobe_mock",
-		New: func() caddy.Module { return new(routeprobeMockDNS) },
+		ID:  "dns.providers.probe_mock",
+		New: func() caddy.Module { return new(probeMockDNS) },
 	}
 }
-func (routeprobeMockDNS) Provision(caddy.Context) error { return nil }
+func (probeMockDNS) Provision(caddy.Context) error { return nil }
 
 // libdns interfaces (AppendRecords, DeleteRecords, GetRecords,
 // SetRecords) are referenced by name when certmagic checks the
 // provider type-asserts. Returning empty results matches the existing
 // caddytest/integration MockDNSProvider.
-func (routeprobeMockDNS) AppendRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
+func (probeMockDNS) AppendRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
 	return nil, nil
 }
-func (routeprobeMockDNS) DeleteRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
+func (probeMockDNS) DeleteRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
 	return nil, nil
 }
-func (routeprobeMockDNS) GetRecords(context.Context, string) ([]libdns.Record, error) {
+func (probeMockDNS) GetRecords(context.Context, string) ([]libdns.Record, error) {
 	return nil, nil
 }
-func (routeprobeMockDNS) SetRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
+func (probeMockDNS) SetRecords(context.Context, string, []libdns.Record) ([]libdns.Record, error) {
 	return nil, nil
 }
 
 func init() {
-	caddy.RegisterModule(routeprobeMockDNS{})
+	caddy.RegisterModule(probeMockDNS{})
 }
 
 // TestE2E_NoOnDemand_NoModuleLoaded verifies that a config with no
@@ -566,7 +566,7 @@ func TestE2E_StaticCert_BypassesProbe(t *testing.T) {
 // on-demand handshake), subsequent handshakes for the same hostname
 // reuse the cache and don't re-trigger the probe.
 //
-// The oracle is again the upstream stub; with RandomHostProbe
+// The oracle is again the upstream stub; with RandomHostChallenge
 // disabled (so we get exactly one probe request per cert miss), the
 // test asserts the upstream sees exactly 1 request after two
 // handshakes — proof that the second hit the cache.
@@ -626,8 +626,8 @@ func TestE2E_CachedCert_BypassesProbeOnSecondHandshake(t *testing.T) {
 					}],
 					"on_demand": {
 						"permission": {
-							"module": "route_probe",
-							"random_host_probe": false
+							"module": "probe",
+							"random_host_challenge": false
 						}
 					}
 				}

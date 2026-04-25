@@ -1,9 +1,9 @@
 {
 	on_demand_tls {
-		route_probe {
+		probe {
 			method GET
 			timeout 5s
-			random_host_probe false
+			random_host_challenge false
 		}
 	}
 }
@@ -70,8 +70,8 @@
 				"on_demand": {
 					"permission": {
 						"method": "GET",
-						"module": "route_probe",
-						"random_host_probe": false,
+						"module": "probe",
+						"random_host_challenge": false,
 						"timeout": 5000000000
 					}
 				}

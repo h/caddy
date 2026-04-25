@@ -52,8 +52,8 @@ func TestApplyOnDemandPermissionDefault_InjectsForCatchAllPolicy(t *testing.T) {
 		t.Fatal("expected OnDemand config to be created")
 	}
 	got := string(tlsApp.Automation.OnDemand.PermissionRaw)
-	if !strings.Contains(got, `"module":"route_probe"`) {
-		t.Errorf("expected default permission module to be route_probe; got PermissionRaw=%s", got)
+	if !strings.Contains(got, `"module":"probe"`) {
+		t.Errorf("expected default permission module to be probe; got PermissionRaw=%s", got)
 	}
 }
 
@@ -69,8 +69,8 @@ func TestApplyOnDemandPermissionDefault_InjectsForWildcardPolicy(t *testing.T) {
 	tlsApp.applyOnDemandPermissionDefault()
 
 	if tlsApp.Automation.OnDemand == nil ||
-		!strings.Contains(string(tlsApp.Automation.OnDemand.PermissionRaw), `"module":"route_probe"`) {
-		t.Errorf("expected route_probe default for wildcard policy; got %+v", tlsApp.Automation.OnDemand)
+		!strings.Contains(string(tlsApp.Automation.OnDemand.PermissionRaw), `"module":"probe"`) {
+		t.Errorf("expected probe default for wildcard policy; got %+v", tlsApp.Automation.OnDemand)
 	}
 }
 
@@ -108,8 +108,8 @@ func TestApplyOnDemandPermissionDefault_InjectsWhenAnyPolicyIsWildcard(t *testin
 	tlsApp.applyOnDemandPermissionDefault()
 
 	if tlsApp.Automation.OnDemand == nil ||
-		!strings.Contains(string(tlsApp.Automation.OnDemand.PermissionRaw), `"module":"route_probe"`) {
-		t.Errorf("expected route_probe default when at least one policy is wildcard; got %+v",
+		!strings.Contains(string(tlsApp.Automation.OnDemand.PermissionRaw), `"module":"probe"`) {
+		t.Errorf("expected probe default when at least one policy is wildcard; got %+v",
 			tlsApp.Automation.OnDemand)
 	}
 }

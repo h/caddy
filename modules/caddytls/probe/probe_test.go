@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package routeprobe
+package probe
 
 import (
 	"context"
@@ -69,16 +69,16 @@ func (s *stubDispatch) callCount() int {
 	return len(s.calls)
 }
 
-// newPerm produces a PermissionByRouteProbe with sensible defaults
+// newPerm produces a Permission with sensible defaults
 // for testing: HEAD method, 1s timeout, random-host probe on, no
 // DNS coverage, and a logger that drops everything.
-func newPerm(t *testing.T, dispatch *stubDispatch) *PermissionByRouteProbe {
+func newPerm(t *testing.T, dispatch *stubDispatch) *Permission {
 	t.Helper()
 	tr := true
-	return &PermissionByRouteProbe{
+	return &Permission{
 		Method:             "HEAD",
 		Timeout:            caddy.Duration(time.Second),
-		RandomHostProbe: &tr,
+		RandomHostChallenge: &tr,
 		logger:             zap.NewNop(),
 		dispatchFn:         dispatch.fn(),
 		dnsCoversFn:        func(string) bool { return false },
@@ -189,7 +189,7 @@ func TestCertificateAllowed_PropagatesDispatchError(t *testing.T) {
 // CertificateAllowed: random-host probe
 // ============================================================
 
-func TestCertificateAllowed_DeniesWhenRandomHostProbeAlsoSucceeds(t *testing.T) {
+func TestCertificateAllowed_DeniesWhenRandomHostChallengeAlsoSucceeds(t *testing.T) {
 	// Backend returns 200 for any host — classic Host-blind misconfiguration.
 	stub := &stubDispatch{respond: always(200, true, nil)}
 	p := newPerm(t, stub)
@@ -206,23 +206,23 @@ func TestCertificateAllowed_DeniesWhenRandomHostProbeAlsoSucceeds(t *testing.T) 
 	}
 }
 
-func TestCertificateAllowed_AllowsWhenRandomHostProbeDisabled(t *testing.T) {
+func TestCertificateAllowed_AllowsWhenRandomHostChallengeDisabled(t *testing.T) {
 	// Even if backend would return 200 for any host, with the
 	// random-host probe disabled we allow.
 	stub := &stubDispatch{respond: always(200, true, nil)}
 	fl := false
 	p := newPerm(t, stub)
-	p.RandomHostProbe = &fl
+	p.RandomHostChallenge = &fl
 
 	if err := p.CertificateAllowed(context.Background(), "foo.example.com"); err != nil {
-		t.Fatalf("expected allow with random_host_probe=false, got: %v", err)
+		t.Fatalf("expected allow with random_host_challenge=false, got: %v", err)
 	}
 	if got := stub.callCount(); got != 1 {
 		t.Errorf("expected 1 dispatch call when random-host probe is disabled, got %d", got)
 	}
 }
 
-func TestCertificateAllowed_AllowsWhenRandomHostProbeReturnsNon2xx(t *testing.T) {
+func TestCertificateAllowed_AllowsWhenRandomHostChallengeReturnsNon2xx(t *testing.T) {
 	stub := &stubDispatch{respond: byRandomHost(
 		"foo.example.com",
 		dispatchResp{status: 200, matched: true},
@@ -235,7 +235,7 @@ func TestCertificateAllowed_AllowsWhenRandomHostProbeReturnsNon2xx(t *testing.T)
 	}
 }
 
-func TestCertificateAllowed_AllowsWhenRandomHostProbeErrors(t *testing.T) {
+func TestCertificateAllowed_AllowsWhenRandomHostChallengeErrors(t *testing.T) {
 	// Real probe 2xx, random-host probe network error → backend isn't responding to fake
 	// hosts at all, which is *good*. Allow the cert.
 	stub := &stubDispatch{respond: byRandomHost(
@@ -310,57 +310,57 @@ func TestCertificateAllowed_AppliesTimeout(t *testing.T) {
 }
 
 // ============================================================
-// Method, timeout, and random_host_probe defaults
+// Method, timeout, and random_host_challenge defaults
 // ============================================================
 
 func TestMethodDefault(t *testing.T) {
-	p := &PermissionByRouteProbe{}
+	p := &Permission{}
 	if got := p.method(); got != "HEAD" {
 		t.Errorf("default method: got %q, want %q", got, "HEAD")
 	}
 }
 
 func TestMethodOverride(t *testing.T) {
-	p := &PermissionByRouteProbe{Method: "GET"}
+	p := &Permission{Method: "GET"}
 	if got := p.method(); got != "GET" {
 		t.Errorf("method override: got %q, want %q", got, "GET")
 	}
 }
 
 func TestTimeoutDefault(t *testing.T) {
-	p := &PermissionByRouteProbe{}
+	p := &Permission{}
 	if got := p.timeout(); got != 10*time.Second {
 		t.Errorf("default timeout: got %v, want 10s", got)
 	}
 }
 
 func TestTimeoutOverride(t *testing.T) {
-	p := &PermissionByRouteProbe{Timeout: caddy.Duration(3 * time.Second)}
+	p := &Permission{Timeout: caddy.Duration(3 * time.Second)}
 	if got := p.timeout(); got != 3*time.Second {
 		t.Errorf("timeout override: got %v, want 3s", got)
 	}
 }
 
-func TestRandomHostProbeEnabled_NilDefaultsTrue(t *testing.T) {
-	p := &PermissionByRouteProbe{}
-	if !p.randomHostProbeEnabled() {
-		t.Error("expected random-host probe to default to enabled when RandomHostProbe is nil")
+func TestRandomHostChallengeEnabled_NilDefaultsTrue(t *testing.T) {
+	p := &Permission{}
+	if !p.randomHostChallengeEnabled() {
+		t.Error("expected random-host probe to default to enabled when RandomHostChallenge is nil")
 	}
 }
 
-func TestRandomHostProbeEnabled_ExplicitTrue(t *testing.T) {
+func TestRandomHostChallengeEnabled_ExplicitTrue(t *testing.T) {
 	tr := true
-	p := &PermissionByRouteProbe{RandomHostProbe: &tr}
-	if !p.randomHostProbeEnabled() {
-		t.Error("expected random-host probe to be enabled when RandomHostProbe=true")
+	p := &Permission{RandomHostChallenge: &tr}
+	if !p.randomHostChallengeEnabled() {
+		t.Error("expected random-host probe to be enabled when RandomHostChallenge=true")
 	}
 }
 
-func TestRandomHostProbeEnabled_ExplicitFalse(t *testing.T) {
+func TestRandomHostChallengeEnabled_ExplicitFalse(t *testing.T) {
 	fl := false
-	p := &PermissionByRouteProbe{RandomHostProbe: &fl}
-	if p.randomHostProbeEnabled() {
-		t.Error("expected random-host probe to be disabled when RandomHostProbe=false")
+	p := &Permission{RandomHostChallenge: &fl}
+	if p.randomHostChallengeEnabled() {
+		t.Error("expected random-host probe to be disabled when RandomHostChallenge=false")
 	}
 }
 
@@ -426,15 +426,15 @@ func TestRandomizeFirstLabel_HandlesBareHostname(t *testing.T) {
 func TestUnmarshalCaddyfile_EmptyBlock(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`reverse_proxy {
     }`)
-	p := &PermissionByRouteProbe{}
+	p := &Permission{}
 	if err := p.UnmarshalCaddyfile(d); err != nil {
 		t.Fatalf("expected empty block to parse cleanly; got: %v", err)
 	}
 	if p.method() != "HEAD" {
 		t.Errorf("default method after empty parse: got %q want HEAD", p.method())
 	}
-	if !p.randomHostProbeEnabled() {
-		t.Error("random_host_probe should default to true after empty parse")
+	if !p.randomHostChallengeEnabled() {
+		t.Error("random_host_challenge should default to true after empty parse")
 	}
 }
 
@@ -442,9 +442,9 @@ func TestUnmarshalCaddyfile_FullBlock(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`reverse_proxy {
         method GET
         timeout 5s
-        random_host_probe false
+        random_host_challenge false
     }`)
-	p := &PermissionByRouteProbe{}
+	p := &Permission{}
 	if err := p.UnmarshalCaddyfile(d); err != nil {
 		t.Fatalf("UnmarshalCaddyfile: %v", err)
 	}
@@ -454,8 +454,8 @@ func TestUnmarshalCaddyfile_FullBlock(t *testing.T) {
 	if time.Duration(p.Timeout) != 5*time.Second {
 		t.Errorf("Timeout: got %v, want 5s", time.Duration(p.Timeout))
 	}
-	if p.RandomHostProbe == nil || *p.RandomHostProbe {
-		t.Errorf("RandomHostProbe: got %v, want explicit false", p.RandomHostProbe)
+	if p.RandomHostChallenge == nil || *p.RandomHostChallenge {
+		t.Errorf("RandomHostChallenge: got %v, want explicit false", p.RandomHostChallenge)
 	}
 }
 
@@ -463,7 +463,7 @@ func TestUnmarshalCaddyfile_UnknownDirective(t *testing.T) {
 	d := caddyfile.NewTestDispenser(`reverse_proxy {
         wat unknown
     }`)
-	p := &PermissionByRouteProbe{}
+	p := &Permission{}
 	if err := p.UnmarshalCaddyfile(d); err == nil {
 		t.Error("expected error for unknown directive, got nil")
 	}
@@ -474,14 +474,14 @@ func TestUnmarshalCaddyfile_UnknownDirective(t *testing.T) {
 // ============================================================
 
 func TestModuleID(t *testing.T) {
-	info := PermissionByRouteProbe{}.CaddyModule()
-	if info.ID != "tls.permission.route_probe" {
-		t.Errorf("module ID: got %q, want tls.permission.route_probe", info.ID)
+	info := Permission{}.CaddyModule()
+	if info.ID != "tls.permission.probe" {
+		t.Errorf("module ID: got %q, want tls.permission.probe", info.ID)
 	}
 }
 
 func TestImplementsOnDemandPermission(t *testing.T) {
-	var _ caddytls.OnDemandPermission = (*PermissionByRouteProbe)(nil)
+	var _ caddytls.OnDemandPermission = (*Permission)(nil)
 }
 
 // ============================================================

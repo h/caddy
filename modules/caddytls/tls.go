@@ -769,7 +769,7 @@ func (t *TLS) getConfigForName(name string) *certmagic.Config {
 	return ap.magic
 }
 
-// applyOnDemandPermissionDefault wires the route_probe permission
+// applyOnDemandPermissionDefault wires the probe permission
 // module as the default when an on-demand policy *would otherwise have
 // failed the safety check* — i.e., the policy is wildcard-or-default
 // (no subject filter, or includes a "*" wildcard) and uses public
@@ -819,8 +819,8 @@ func (t *TLS) applyOnDemandPermissionDefault() {
 		t.Automation.OnDemand = new(OnDemandConfig)
 	}
 	if t.Automation.OnDemand.PermissionRaw == nil && t.Automation.OnDemand.Ask == "" {
-		// Keep this module ID in sync with routeprobe.PermissionByRouteProbe.CaddyModule().ID.
-		t.Automation.OnDemand.PermissionRaw = json.RawMessage(`{"module":"route_probe"}`)
+		// Keep this module ID in sync with probe.Permission.CaddyModule().ID.
+		t.Automation.OnDemand.PermissionRaw = json.RawMessage(`{"module":"probe"}`)
 	}
 }
 
